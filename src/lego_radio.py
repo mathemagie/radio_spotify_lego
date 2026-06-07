@@ -21,6 +21,7 @@ import curses
 import functools
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ import webbrowser
 CONFIG_DIR = os.path.expanduser("~/.config/lego_radio")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_FILE = os.path.join(CONFIG_DIR, "token_cache.json")
+LIKES_CACHE_FILE = os.path.join(CONFIG_DIR, "likes_cache.json")
 REDIRECT_URI = "http://127.0.0.1:8888/callback"
 SCOPES = (
     "user-library-read user-read-playback-state "
@@ -41,10 +43,10 @@ BRICK_FULL, BRICK_EMPTY = "▰", "▱"
 
 # ───────────────────────── config & first-run wizard ─────────────────────────
 
-G = "\x1b[38;5;41m"      # spotify green
-Y = "\x1b[38;5;220m"     # lego yellow
-R = "\x1b[38;5;196m"     # lego red
-D = "\x1b[38;5;244m"     # dim
+G = "\x1b[38;5;41m"  # spotify green
+Y = "\x1b[38;5;220m"  # lego yellow
+R = "\x1b[38;5;196m"  # lego red
+D = "\x1b[38;5;244m"  # dim
 B = "\x1b[1m"
 X = "\x1b[0m"
 
@@ -121,15 +123,18 @@ class Player:
     def __init__(self, sp):
         self.sp = sp
         self.lock = threading.Lock()
-        self.tracks = []            # [{uri, name, artist, album, ms}]
+        self.tracks = []  # [{uri, name, artist, album, ms}]
         self.loading = True
         self.load_count = 0
-        self.playback = None        # raw playback dict
+        self.playback = None  # raw playback dict
         self.poll_ts = 0.0
         self.error = ""
         self.error_ts = 0.0
+        self.notice = ""  # transient status (e.g. browser opening)
+        self.notice_ts = 0.0
         self.search_results = None  # None = inactive; list = global results
         self.search_loading = False
+        self.search_gen = 0  # invalidates stale/clobbered search threads
 
     # -- liked songs --
     @staticmethod
@@ -141,25 +146,57 @@ class Player:
                 continue
             artist = ", ".join(a["name"] for a in t["artists"])
             album = (t.get("album") or {}).get("name", "")
-            items.append({
-                "uri": t["uri"],
-                "name": t["name"],
-                "artist": artist,
-                "album": album,
-                "ms": t.get("duration_ms", 0),
-                # precomputed search key — folding 400+ strings per
-                # frame while typing is what made search feel slow
-                "key": fold(t["name"] + " " + artist + " " + album),
-            })
+            items.append(
+                {
+                    "uri": t["uri"],
+                    "name": t["name"],
+                    "artist": artist,
+                    "album": album,
+                    "ms": t.get("duration_ms", 0),
+                    # precomputed search key — folding 400+ strings per
+                    # frame while typing is what made search feel slow
+                    "key": fold(t["name"] + " " + artist + " " + album),
+                }
+            )
         return items
 
+    @staticmethod
+    def _read_likes_cache():
+        try:
+            with open(LIKES_CACHE_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, list) and data:
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return None
+
+    @staticmethod
+    def _write_likes_cache(items):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(LIKES_CACHE_FILE, "w") as f:
+                json.dump(items, f)
+            os.chmod(LIKES_CACHE_FILE, 0o600)
+        except OSError:
+            pass  # best-effort; a write failure just means a cold sync next launch
+
     def load_likes(self):
+        # last session's library shows instantly from disk; the network
+        # refresh swaps in atomically below, so a slow or offline sync
+        # never blanks the list the user is already scrolling
+        cached = self._read_likes_cache()
+        if cached:
+            with self.lock:
+                self.tracks = cached
+                self.load_count = len(cached)
         try:
             first = self.sp.current_user_saved_tracks(limit=50, offset=0)
             items = self._parse_page(first)
-            with self.lock:
-                self.tracks = list(items)
-                self.load_count = len(items)
+            if not cached:  # nothing on screen yet → fill in live, page by page
+                with self.lock:
+                    self.tracks = list(items)
+                    self.load_count = len(items)
             # the first page tells us the library size, so the remaining
             # pages can be fetched concurrently (4 workers stays well under
             # Spotify's rate limits) instead of one round-trip at a time.
@@ -167,33 +204,41 @@ class Player:
             # still fills in top-to-bottom as pages land.
             offsets = range(50, first.get("total") or 0, 50)
             if offsets:
-                fetch = lambda o: self.sp.current_user_saved_tracks(
-                    limit=50, offset=o)
+                fetch = lambda o: self.sp.current_user_saved_tracks(limit=50, offset=o)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
                     for page in ex.map(fetch, offsets):
                         items = items + self._parse_page(page)
-                        with self.lock:
-                            self.tracks = items
-                            self.load_count = len(items)
+                        if not cached:  # cold: grow live; warm: one swap at the end
+                            with self.lock:
+                                self.tracks = items
+                                self.load_count = len(items)
+            with self.lock:  # atomic swap — warm start updates here in one step
+                self.tracks = items
+                self.load_count = len(items)
+            self._write_likes_cache(items)
         except Exception as e:
-            self.flag_error(f"likes: {e}")
+            self.flag_error(f"likes: {e}")  # keep cached tracks on screen
         finally:
             with self.lock:
                 self.loading = False
 
     # -- global catalog search --
     def search(self, query):
+        # bump the generation so any slower in-flight search (or a typed-over
+        # query) can't land its results after this newer one — latest wins
         with self.lock:
             self.search_loading = True
+            self.search_gen += 1
+            gen = self.search_gen
 
         def run():
             try:
                 # dev-mode apps 400 on limit > 10 (docs still say 50), so
                 # fetch 5 pages of 10 concurrently — same trick as load_likes
                 def fetch(off):
-                    res = self.sp.search(q=query, type="track",
-                                         limit=10, offset=off)
+                    res = self.sp.search(q=query, type="track", limit=10, offset=off)
                     return (res.get("tracks") or {}).get("items") or []
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
                     pages = list(ex.map(fetch, range(0, 50, 10)))
                 # search repeats tracks across adjacent pages — keep first
@@ -207,17 +252,24 @@ class Player:
                 # saved-tracks {"track": t} wrapper, so adapt and reuse it
                 parsed = self._parse_page({"items": [{"track": t} for t in items]})
                 with self.lock:
-                    self.search_results = parsed
+                    if gen == self.search_gen:  # still the newest request?
+                        self.search_results = parsed
             except Exception as e:
                 self.flag_error(f"search: {e}")
             finally:
                 with self.lock:
-                    self.search_loading = False
+                    if gen == self.search_gen:
+                        self.search_loading = False
+
         threading.Thread(target=run, daemon=True).start()
 
     def clear_search(self):
+        # bump the generation too, so an in-flight search started before Esc
+        # can't repopulate the list after the user cleared it
         with self.lock:
             self.search_results = None
+            self.search_gen += 1
+            self.search_loading = False
 
     # -- playback polling --
     def poll(self):
@@ -247,7 +299,10 @@ class Player:
             except Exception as e:
                 msg = str(e)
                 if "NO_ACTIVE_DEVICE" in msg or "Device not found" in msg:
-                    msg = "no active device — open Spotify somewhere or press [d]"
+                    # [o] opens the web player, which registers as a
+                    # Connect device — but launching a browser is the
+                    # user's call, never the app's (trust beats magic)
+                    msg = "no active device — [o] web player or [d] devices"
                 elif "PREMIUM_REQUIRED" in msg:
                     msg = "Spotify Premium is required for remote playback control"
                 self.flag_error(f"{label}: {msg}")
@@ -257,10 +312,11 @@ class Player:
                     self.poll()
                 except Exception:
                     pass
+
         threading.Thread(target=run, daemon=True).start()
 
     def play_from(self, idx, track_list):
-        chunk = [t["uri"] for t in track_list[idx:idx + 100]]
+        chunk = [t["uri"] for t in track_list[idx : idx + 100]]
         if not chunk:
             return
         t = track_list[idx]
@@ -273,10 +329,13 @@ class Player:
                 "is_playing": True,
                 "shuffle_state": False,
                 "progress_ms": 0,
-                "item": {"uri": t["uri"], "name": t["name"],
-                         "duration_ms": t["ms"],
-                         "artists": [{"name": t["artist"]}],
-                         "album": {"name": t["album"]}},
+                "item": {
+                    "uri": t["uri"],
+                    "name": t["name"],
+                    "duration_ms": t["ms"],
+                    "artists": [{"name": t["artist"]}],
+                    "album": {"name": t["album"]},
+                },
                 "device": (self.playback or {}).get("device"),
             }
             self.poll_ts = time.monotonic()
@@ -293,6 +352,7 @@ class Player:
                 except Exception:
                     pass
             self.sp.start_playback(device_id=dev, uris=chunk)
+
         self._cmd(start, "play")
 
     def toggle_pause(self):
@@ -347,9 +407,11 @@ class Player:
         with self.lock:  # optimistic: show the new device in the bar now
             if self.playback and self.playback.get("device"):
                 self.playback["device"] = dict(
-                    self.playback["device"], id=device["id"], name=device["name"])
-        self._cmd(lambda: self.sp.transfer_playback(device["id"], force_play=True),
-                  "transfer")
+                    self.playback["device"], id=device["id"], name=device["name"]
+                )
+        self._cmd(
+            lambda: self.sp.transfer_playback(device["id"], force_play=True), "transfer"
+        )
 
     def _device_id(self):
         with self.lock:
@@ -364,14 +426,56 @@ class Player:
             self.error = msg[:200]
             self.error_ts = time.monotonic()
 
+    def flag_notice(self, msg):
+        with self.lock:
+            self.notice = msg[:200]
+            self.notice_ts = time.monotonic()
+
+
+def open_url(url):
+    """Open url in Chrome when available, else the default browser.
+
+    Chrome is detected through the webbrowser API: get() raises
+    webbrowser.Error when the named browser is missing, and open()
+    returns False when the launch fails. macOS Pythons don't register
+    Chrome under a usable name, so there we ask Launch Services
+    (`open -Ra`) whether Chrome exists before targeting it.
+    """
+    if sys.platform == "darwin":
+        has_chrome = (
+            subprocess.run(
+                ["open", "-Ra", "Google Chrome"], capture_output=True
+            ).returncode
+            == 0
+        )
+        if (
+            has_chrome
+            and subprocess.run(
+                ["open", "-a", "Google Chrome", url], capture_output=True
+            ).returncode
+            == 0
+        ):
+            return
+    else:
+        for name in ("chrome", "google-chrome", "chromium"):
+            try:
+                if webbrowser.get(name).open(url):
+                    return
+            except webbrowser.Error:
+                pass
+    webbrowser.open(url)
+
 
 # ───────────────────────────── ui helpers ─────────────────────────────
 
 
 @functools.lru_cache(maxsize=4096)
 def fold(s):
-    return "".join(c for c in unicodedata.normalize("NFD", s.lower())
-                   if unicodedata.category(c) != "Mn")
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFD", s.lower())
+        if unicodedata.category(c) != "Mn"
+    )
 
 
 def fmt_ms(ms):
@@ -387,6 +491,7 @@ def clip(s, w):
 
 class Pal:
     """Color pair registry."""
+
     GREEN, DIM, BRIGHT, YELLOW, RED, SEL, HEAD, BAR = range(1, 9)
 
     @staticmethod
@@ -397,8 +502,13 @@ class Pal:
             green, dim, bright, yellow, red, black = 41, 244, 231, 220, 196, 233
         else:
             green, dim, bright, yellow, red, black = (
-                curses.COLOR_GREEN, curses.COLOR_WHITE, curses.COLOR_WHITE,
-                curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_BLACK)
+                curses.COLOR_GREEN,
+                curses.COLOR_WHITE,
+                curses.COLOR_WHITE,
+                curses.COLOR_YELLOW,
+                curses.COLOR_RED,
+                curses.COLOR_BLACK,
+            )
         curses.init_pair(Pal.GREEN, green, -1)
         curses.init_pair(Pal.DIM, dim, -1)
         curses.init_pair(Pal.BRIGHT, bright, -1)
@@ -450,8 +560,11 @@ class App:
     def visible_tracks(self):
         with self.p.lock:
             # global results replace likes while active; / filters either
-            tracks = self.p.search_results \
-                if self.p.search_results is not None else self.p.tracks
+            tracks = (
+                self.p.search_results
+                if self.p.search_results is not None
+                else self.p.tracks
+            )
         if not self.query:
             return tracks
         # memoized: draw() calls this several times per frame, and the
@@ -490,8 +603,13 @@ class App:
         put(self.scr, 0, 0, "▄" * (w - 1), Pal.c(Pal.YELLOW))
         bar = f" {studs}"
         put(self.scr, 1, 0, bar, Pal.c(Pal.YELLOW))
-        put(self.scr, 1, max(0, (w - len(title)) // 2), title,
-            Pal.c(Pal.HEAD, bold=True))
+        put(
+            self.scr,
+            1,
+            max(0, (w - len(title)) // 2),
+            title,
+            Pal.c(Pal.HEAD, bold=True),
+        )
         with self.p.lock:
             n, loading, cnt = len(self.p.tracks), self.p.loading, self.p.load_count
             results, searching = self.p.search_results, self.p.search_loading
@@ -564,12 +682,13 @@ class App:
         with self.p.lock:
             pb, ts = self.p.playback, self.p.poll_ts
             err, err_ts = self.p.error, self.p.error_ts
+            note, note_ts = self.p.notice, self.p.notice_ts
         item = (pb or {}).get("item")
         if item:
             playing = pb.get("is_playing")
             icon = "▶" if playing else "⏸"
             shuffle = " ⤨" if pb.get("shuffle_state") else ""
-            dev = (pb.get("device") or {})
+            dev = pb.get("device") or {}
             vol = dev.get("volume_percent")
             artists = ", ".join(a["name"] for a in item.get("artists", []))
             album = (item.get("album") or {}).get("name", "")
@@ -577,9 +696,20 @@ class App:
             if album and album != item["name"]:  # skip redundant single-titles
                 byline += f" · {clip(album, w // 4)}"
             put(self.scr, y + 1, 2, f"{icon} ", Pal.c(Pal.GREEN, bold=True))
-            put(self.scr, y + 1, 4, clip(item["name"], w // 2), Pal.c(Pal.BRIGHT, bold=True))
-            put(self.scr, y + 1, 5 + min(len(item["name"]), w // 2),
-                f"{byline}{shuffle}", Pal.c(Pal.DIM))
+            put(
+                self.scr,
+                y + 1,
+                4,
+                clip(item["name"], w // 2),
+                Pal.c(Pal.BRIGHT, bold=True),
+            )
+            put(
+                self.scr,
+                y + 1,
+                5 + min(len(item["name"]), w // 2),
+                f"{byline}{shuffle}",
+                Pal.c(Pal.DIM),
+            )
             right = f"{dev.get('name', '?')}  vol {vol if vol is not None else '–'}%"
             put(self.scr, y + 1, max(2, w - len(right) - 2), right, Pal.c(Pal.YELLOW))
             # progress bricks
@@ -592,18 +722,38 @@ class App:
             filled = int(bar_w * prog / total)
             put(self.scr, y + 2, 2, fmt_ms(prog).rjust(5), Pal.c(Pal.DIM))
             put(self.scr, y + 2, 8, BRICK_FULL * filled, Pal.c(Pal.BAR, bold=True))
-            put(self.scr, y + 2, 8 + filled, BRICK_EMPTY * (bar_w - filled), Pal.c(Pal.DIM))
+            put(
+                self.scr,
+                y + 2,
+                8 + filled,
+                BRICK_EMPTY * (bar_w - filled),
+                Pal.c(Pal.DIM),
+            )
             put(self.scr, y + 2, 9 + bar_w, fmt_ms(total), Pal.c(Pal.DIM))
         else:
-            put(self.scr, y + 1, 2, "⏹ nothing playing — pick a track and hit Enter",
-                Pal.c(Pal.DIM))
+            put(
+                self.scr,
+                y + 1,
+                2,
+                "⏹ nothing playing — pick a track and hit Enter",
+                Pal.c(Pal.DIM),
+            )
+        # errors win the line; otherwise a short-lived notice (e.g. a
+        # browser launch) fills the wait so the keypress feels answered
         if err and time.monotonic() - err_ts < 6:
             put(self.scr, y + 3, 2, f"✗ {err}", Pal.c(Pal.RED, bold=True))
+        elif note and time.monotonic() - note_ts < 3:
+            put(self.scr, y + 3, 2, f"↗ {note}", Pal.c(Pal.GREEN))
 
     def draw_footer(self, y, w):
         if self.global_searching:
-            put(self.scr, y, 0, f" ⌕ {self.global_query}▏ (all Spotify — ⏎ search)",
-                Pal.c(Pal.YELLOW, bold=True))
+            put(
+                self.scr,
+                y,
+                0,
+                f" ⌕ {self.global_query}▏ (all Spotify — ⏎ search)",
+                Pal.c(Pal.YELLOW, bold=True),
+            )
             return
         if self.searching:
             put(self.scr, y, 0, f" / {self.query}▏", Pal.c(Pal.YELLOW, bold=True))
@@ -616,15 +766,34 @@ class App:
         if self.all_keys:
             # ordered so a narrow terminal clips the already-learned
             # navigation keys, never "? less" / "q quit"
-            keys = [("⏎", "play"), ("space", "pause"), ("n/p", "skip"),
-                    ("s", "shuffle"), ("+/-", "vol"), ("/", "search"),
-                    ("f", "find all"), ("d", "devices"), ("r", "reload"),
-                    ("?", "less"), ("q", "quit"), ("↑↓/jk", "move"),
-                    ("g/G", "top/end")]
+            keys = [
+                ("⏎", "play"),
+                ("space", "pause"),
+                ("n/p", "skip"),
+                ("s", "shuffle"),
+                ("+/-", "vol"),
+                ("·", ""),
+                ("/", "search"),
+                ("f", "find all"),
+                ("o", "↗track"),
+                ("d", "devices"),
+                ("r", "reload"),
+                ("·", ""),
+                ("?", "less"),
+                ("q", "quit"),
+                ("↑↓/jk", "move"),
+                ("g/G", "top/end"),
+            ]
         else:
-            keys = [("⏎", "play"), ("space", "pause"), ("n/p", "skip"),
-                    ("/", "search"), ("f", "find all"), ("?", "more"),
-                    ("q", "quit")]
+            keys = [
+                ("⏎", "play"),
+                ("space", "pause"),
+                ("n/p", "skip"),
+                ("/", "search"),
+                ("f", "find all"),
+                ("?", "more"),
+                ("q", "quit"),
+            ]
         # active-filter marker, pinned right; keys never draw under it
         kw = w
         if self.query:
@@ -633,6 +802,12 @@ class App:
             put(self.scr, y, kw, mark, Pal.c(Pal.YELLOW))
         x = 1
         for k, label in keys:
+            if k == "·":  # group divider, not a key — dim, no chip
+                if x + 3 > kw:
+                    break
+                put(self.scr, y, x, "·  ", Pal.c(Pal.DIM))
+                x += 3
+                continue
             if x + len(k) + len(label) + 4 > kw:
                 break
             put(self.scr, y, x, f" {k} ", Pal.c(Pal.SEL, bold=True))
@@ -646,21 +821,40 @@ class App:
         for i in range(bh):
             put(win, y0 + i, x0, " " * bw, Pal.c(Pal.HEAD))
         put(win, y0, x0, "╔" + "═" * (bw - 2) + "╗", Pal.c(Pal.YELLOW, bold=True))
-        put(win, y0 + bh - 1, x0, "╚" + "═" * (bw - 2) + "╝", Pal.c(Pal.YELLOW, bold=True))
+        put(
+            win,
+            y0 + bh - 1,
+            x0,
+            "╚" + "═" * (bw - 2) + "╝",
+            Pal.c(Pal.YELLOW, bold=True),
+        )
         for i in range(1, bh - 1):
             put(win, y0 + i, x0, "║", Pal.c(Pal.YELLOW, bold=True))
             put(win, y0 + i, x0 + bw - 1, "║", Pal.c(Pal.YELLOW, bold=True))
-        put(win, y0, x0 + 3, "[ ◈ SPOTIFY CONNECT DEVICES ]", Pal.c(Pal.YELLOW, bold=True))
+        put(
+            win,
+            y0,
+            x0 + 3,
+            "[ ◈ SPOTIFY CONNECT DEVICES ]",
+            Pal.c(Pal.YELLOW, bold=True),
+        )
         if self.device_loading and not self.device_list:
             spin = SPINNER[self.spin % len(SPINNER)]
             put(win, y0 + 2, x0 + 3, f"{spin} scanning devices…", Pal.c(Pal.GREEN))
         elif not self.device_list:
-            put(win, y0 + 2, x0 + 3, "none found — open Spotify on a device",
-                Pal.c(Pal.DIM))
+            put(
+                win,
+                y0 + 2,
+                x0 + 3,
+                "none found — open Spotify on a device",
+                Pal.c(Pal.DIM),
+            )
         for i, d in enumerate(self.device_list[: bh - 4]):
             mark = "●" if d.get("is_active") else "○"
             line = f"{mark} {d['name']}  ({d['type'].lower()})"
-            attr = Pal.c(Pal.SEL, bold=True) if i == self.device_sel else Pal.c(Pal.BRIGHT)
+            attr = (
+                Pal.c(Pal.SEL, bold=True) if i == self.device_sel else Pal.c(Pal.BRIGHT)
+            )
             put(win, y0 + 2 + i, x0 + 3, clip(line, bw - 6), attr)
         put(win, y0 + bh - 1, x0 + 3, "[ ⏎ select · Esc close ]", Pal.c(Pal.DIM))
 
@@ -704,6 +898,17 @@ class App:
             self.p.volume(-10)
         elif ch == ord("s"):
             self.p.shuffle_toggle()
+        elif ch == ord("o"):
+            if tracks:
+                # spotify:track:ID → https://open.spotify.com/track/ID
+                t = tracks[self.sel]
+                tid = t["uri"].rsplit(":", 1)[-1]
+                url = f"https://open.spotify.com/track/{tid}"
+                # the launch is invisible for ~1s; name the track so the
+                # flash connects the keypress to what it acted on (#3, #10)
+                self.p.flag_notice(f"opening {clip(t['name'], 40)} in browser…")
+                # browser launch can block — never on the UI thread
+                threading.Thread(target=open_url, args=(url,), daemon=True).start()
         elif ch == ord("/"):
             self.searching = True
         elif ch == ord("f"):
@@ -728,6 +933,7 @@ class App:
                 def fetch():
                     self.device_list = self.p.devices()
                     self.device_loading = False
+
                 threading.Thread(target=fetch, daemon=True).start()
         elif ch == ord("r"):
             with self.p.lock:
@@ -743,11 +949,14 @@ class App:
             self.searching = False
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             self.query = self.query[:-1]
-        elif ch in (curses.KEY_UP, curses.KEY_DOWN,
-                    curses.KEY_PPAGE, curses.KEY_NPAGE):
+        elif ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
             # browse results without leaving the search box (fzf-style)
-            step = {curses.KEY_UP: -1, curses.KEY_DOWN: 1,
-                    curses.KEY_PPAGE: -15, curses.KEY_NPAGE: 15}[ch]
+            step = {
+                curses.KEY_UP: -1,
+                curses.KEY_DOWN: 1,
+                curses.KEY_PPAGE: -15,
+                curses.KEY_NPAGE: 15,
+            }[ch]
             last = max(0, len(self.visible_tracks()) - 1)
             self.sel = max(0, min(self.sel + step, last))
         elif 32 <= ch < 256:
@@ -761,7 +970,7 @@ class App:
         elif ch in (curses.KEY_ENTER, 10, 13):
             self.global_searching = False
             if self.global_query.strip():
-                self.query = ""          # results arrive unfiltered
+                self.query = ""  # results arrive unfiltered
                 self.sel, self.top = 0, 0
                 self.p.search(self.global_query)
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
@@ -777,7 +986,9 @@ class App:
         elif ch in (curses.KEY_UP, ord("k")):
             self.device_sel = max(0, self.device_sel - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
-            self.device_sel = min(max(0, len(self.device_list) - 1), self.device_sel + 1)
+            self.device_sel = min(
+                max(0, len(self.device_list) - 1), self.device_sel + 1
+            )
         elif ch in (curses.KEY_ENTER, 10, 13) and self.device_list:
             self.p.transfer(self.device_list[self.device_sel])
             self.device_mode = False
@@ -822,10 +1033,14 @@ def main():
         me = sp.current_user()
     except Exception as e:
         print(f"  {R}✗ auth failed: {e}{X}")
-        print(f"  {D}check your Client ID and the Redirect URI "
-              f"({REDIRECT_URI}) in the Spotify dashboard.{X}")
+        print(
+            f"  {D}check your Client ID and the Redirect URI "
+            f"({REDIRECT_URI}) in the Spotify dashboard.{X}"
+        )
         sys.exit(1)
-    print(f"  {G}✓ hello, {B}{me.get('display_name') or me['id']}{X}{G} — building bricks…{X}")
+    print(
+        f"  {G}✓ hello, {B}{me.get('display_name') or me['id']}{X}{G} — building bricks…{X}"
+    )
 
     player = Player(sp)
     threading.Thread(target=player.load_likes, daemon=True).start()

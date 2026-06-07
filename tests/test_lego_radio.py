@@ -8,6 +8,7 @@ observable effects with wait_until().
 """
 
 import curses
+import json
 import os
 import tempfile
 import threading
@@ -16,6 +17,21 @@ import unittest
 from unittest import mock
 
 import lego_radio as lr
+
+# every load_likes() would otherwise write the user's real likes cache
+_module_tmp = tempfile.TemporaryDirectory()
+_cache_patch = mock.patch.object(
+    lr, "LIKES_CACHE_FILE", os.path.join(_module_tmp.name, "likes_cache.json")
+)
+
+
+def setUpModule():
+    _cache_patch.start()
+
+
+def tearDownModule():
+    _cache_patch.stop()
+    _module_tmp.cleanup()
 
 
 def wait_until(cond, timeout=3.0):
@@ -45,10 +61,11 @@ class FakeSP:
         self.pages = pages or [{"items": [], "next": None}]
         self.playback = playback
         self.device_payload = {"devices": devices or []}
-        self.raises = {}          # method name -> Exception to raise
+        self.raises = {}  # method name -> Exception to raise
         self.devices_gate = None  # threading.Event to block devices()
-        self.search_gate = None   # threading.Event to block search()
-        self.search_items = []    # full result list; search() slices pages
+        self.search_gate = None  # threading.Event to block search()
+        self.search_items = []  # full result list; search() slices pages
+        self.likes_gate = None  # threading.Event to block saved_tracks()
 
     def _hit(self, name, **kw):
         self.calls.append((name, kw))
@@ -60,6 +77,8 @@ class FakeSP:
 
     # -- spotipy surface used by the app --
     def current_user_saved_tracks(self, limit=50, offset=0):
+        if self.likes_gate is not None:
+            self.likes_gate.wait(3)
         self._hit("current_user_saved_tracks", limit=limit, offset=offset)
         return self.pages[min(offset // 50, len(self.pages) - 1)]
 
@@ -101,19 +120,28 @@ class FakeSP:
         # dev-mode API rejects limit > 10 with 400 Invalid limit
         if limit > 10:
             raise RuntimeError("http status: 400 ... Invalid limit")
-        return {"tracks": {"items": self.search_items[offset:offset + limit]}}
+        return {"tracks": {"items": self.search_items[offset : offset + limit]}}
 
 
-def playing_state(uri="spotify:track:x", is_playing=True, shuffle=False,
-                  volume=70, progress=60_000):
+def playing_state(
+    uri="spotify:track:x", is_playing=True, shuffle=False, volume=70, progress=60_000
+):
     return {
         "is_playing": is_playing,
         "shuffle_state": shuffle,
         "progress_ms": progress,
-        "item": {"uri": uri, "name": "X", "duration_ms": 200_000,
-                 "artists": [{"name": "A"}]},
-        "device": {"id": "dev1", "name": "MacBook", "type": "Computer",
-                   "volume_percent": volume},
+        "item": {
+            "uri": uri,
+            "name": "X",
+            "duration_ms": 200_000,
+            "artists": [{"name": "A"}],
+        },
+        "device": {
+            "id": "dev1",
+            "name": "MacBook",
+            "type": "Computer",
+            "volume_percent": volume,
+        },
     }
 
 
@@ -144,11 +172,12 @@ class TestHelpers(unittest.TestCase):
 
             def addnstr(self, y, x, s, n, attr=0):
                 assert 0 <= y < 5 and 0 <= x < 10 and n <= 10 - x - 1
+
         win = FakeWin()
-        lr.put(win, 2, 3, "hello world", 0)   # clipped, ok
-        lr.put(win, -1, 0, "off top", 0)      # ignored
-        lr.put(win, 9, 0, "off bottom", 0)    # ignored
-        lr.put(win, 2, 99, "off right", 0)    # ignored
+        lr.put(win, 2, 3, "hello world", 0)  # clipped, ok
+        lr.put(win, -1, 0, "off top", 0)  # ignored
+        lr.put(win, 9, 0, "off bottom", 0)  # ignored
+        lr.put(win, 2, 99, "off right", 0)  # ignored
 
 
 class TestConfig(unittest.TestCase):
@@ -159,11 +188,92 @@ class TestConfig(unittest.TestCase):
     def test_save_load_roundtrip_with_0600(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_file = os.path.join(tmp, "config.json")
-            with mock.patch.object(lr, "CONFIG_DIR", tmp), \
-                 mock.patch.object(lr, "CONFIG_FILE", cfg_file):
+            with (
+                mock.patch.object(lr, "CONFIG_DIR", tmp),
+                mock.patch.object(lr, "CONFIG_FILE", cfg_file),
+            ):
                 lr.save_config({"client_id": "abc"})
                 self.assertEqual(lr.load_config(), {"client_id": "abc"})
                 self.assertEqual(os.stat(cfg_file).st_mode & 0o777, 0o600)
+
+
+class TestLikesCache(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cache = os.path.join(self.tmp.name, "likes_cache.json")
+        patcher = mock.patch.object(lr, "LIKES_CACHE_FILE", cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cache_file = cache
+
+    def test_successful_load_writes_cache(self):
+        sp = FakeSP(
+            pages=[{"items": [{"track": mk_track(i)} for i in range(2)], "total": 2}]
+        )
+        p = lr.Player(sp)
+        p.load_likes()
+        with open(self.cache_file) as f:
+            cached = json.load(f)
+        self.assertEqual(cached, p.tracks)
+        self.assertEqual(os.stat(self.cache_file).st_mode & 0o777, 0o600)
+
+    def test_cached_likes_show_before_network_completes(self):
+        cached = [
+            {
+                "uri": f"u{i}",
+                "name": f"C{i}",
+                "artist": "A",
+                "album": "",
+                "ms": 1000,
+                "key": f"c{i} a",
+            }
+            for i in range(5)
+        ]
+        with open(self.cache_file, "w") as f:
+            json.dump(cached, f)
+        sp = FakeSP(pages=[{"items": [{"track": mk_track(0)}], "total": 1}])
+        sp.likes_gate = threading.Event()  # network blocked
+        p = lr.Player(sp)
+        t = threading.Thread(target=p.load_likes, daemon=True)
+        t.start()
+        # cache visible while the network is still hanging
+        self.assertTrue(wait_until(lambda: len(p.tracks) == 5))
+        self.assertEqual(p.tracks[0]["name"], "C0")
+        sp.likes_gate.set()  # refresh lands, swaps in
+        t.join(3)
+        self.assertEqual([t_["name"] for t_ in p.tracks], ["Song 0"])
+        self.assertFalse(p.loading)
+
+    def test_fetch_failure_keeps_cached_likes(self):
+        cached = [
+            {
+                "uri": "u1",
+                "name": "C1",
+                "artist": "A",
+                "album": "",
+                "ms": 1000,
+                "key": "c1 a",
+            }
+        ]
+        with open(self.cache_file, "w") as f:
+            json.dump(cached, f)
+        sp = FakeSP()
+        sp.raises["current_user_saved_tracks"] = RuntimeError("offline")
+        p = lr.Player(sp)
+        p.load_likes()
+        self.assertEqual([t["name"] for t in p.tracks], ["C1"])
+        self.assertIn("likes", p.error)
+        self.assertFalse(p.loading)
+
+    def test_corrupt_cache_is_ignored(self):
+        with open(self.cache_file, "w") as f:
+            f.write("{not json")
+        sp = FakeSP(pages=[{"items": [{"track": mk_track(0)}], "total": 1}])
+        p = lr.Player(sp)
+        p.load_likes()
+        self.assertEqual([t["name"] for t in p.tracks], ["Song 0"])
+        self.assertEqual(p.error, "")
 
 
 # ───────────────────────────── Player ─────────────────────────────
@@ -172,34 +282,49 @@ class TestConfig(unittest.TestCase):
 class TestLoadLikes(unittest.TestCase):
     def test_paginates_and_precomputes_search_key(self):
         pages = [
-            {"items": [{"track": mk_track(i, name=f"Sönг {i}")} for i in range(50)],
-             "total": 51},
-            {"items": [{"track": mk_track(50, name="Pour louper l'école",
-                                          artist="Aldebert")}], "total": 51},
+            {
+                "items": [{"track": mk_track(i, name=f"Sönг {i}")} for i in range(50)],
+                "total": 51,
+            },
+            {
+                "items": [
+                    {
+                        "track": mk_track(
+                            50, name="Pour louper l'école", artist="Aldebert"
+                        )
+                    }
+                ],
+                "total": 51,
+            },
         ]
         p = lr.Player(FakeSP(pages=pages))
         p.load_likes()
         self.assertFalse(p.loading)
         self.assertEqual(len(p.tracks), 51)
         self.assertEqual(p.load_count, 51)
-        self.assertIn("l'ecole", p.tracks[50]["key"])   # folded
+        self.assertIn("l'ecole", p.tracks[50]["key"])  # folded
         self.assertIn("aldebert", p.tracks[50]["key"])  # artist searchable
 
     def test_remaining_pages_fetched_concurrently_in_order(self):
         pages = [
-            {"items": [{"track": mk_track(50 * pg + i)} for i in range(50)],
-             "total": 150}
+            {
+                "items": [{"track": mk_track(50 * pg + i)} for i in range(50)],
+                "total": 150,
+            }
             for pg in range(3)
         ]
         p = lr.Player(FakeSP(pages=pages))
         p.load_likes()
         # all offsets requested, results stitched back in liked order
-        offsets = sorted(kw["offset"]
-                         for kw in p.sp.calls_to("current_user_saved_tracks"))
+        offsets = sorted(
+            kw["offset"] for kw in p.sp.calls_to("current_user_saved_tracks")
+        )
         self.assertEqual(offsets, [0, 50, 100])
         self.assertEqual(len(p.tracks), 150)
-        self.assertEqual([t["uri"] for t in p.tracks],
-                         [f"spotify:track:{i:022d}" for i in range(150)])
+        self.assertEqual(
+            [t["uri"] for t in p.tracks],
+            [f"spotify:track:{i:022d}" for i in range(150)],
+        )
 
     def test_skips_null_tracks(self):
         pages = [{"items": [{"track": None}, {"track": mk_track(1)}], "total": 2}]
@@ -221,9 +346,17 @@ class TestPlayFrom(unittest.TestCase):
         self.sp = FakeSP(playback=playing_state())
         self.p = lr.Player(self.sp)
         self.p.playback = self.sp.playback
-        self.tracks = [{"uri": f"spotify:track:{i}", "name": f"S{i}",
-                        "artist": "A", "album": "", "ms": 1000,
-                        "key": f"s{i} a"} for i in range(120)]
+        self.tracks = [
+            {
+                "uri": f"spotify:track:{i}",
+                "name": f"S{i}",
+                "artist": "A",
+                "album": "",
+                "ms": 1000,
+                "key": f"s{i} a",
+            }
+            for i in range(120)
+        ]
 
     def test_sends_chunk_of_100_from_selection(self):
         self.p.play_from(5, self.tracks)
@@ -266,8 +399,9 @@ class TestPlayFrom(unittest.TestCase):
 
     def test_falls_back_to_first_known_device(self):
         self.p.playback = None
-        self.sp.device_payload = {"devices": [{"id": "devX", "name": "Phone",
-                                               "type": "Smartphone"}]}
+        self.sp.device_payload = {
+            "devices": [{"id": "devX", "name": "Phone", "type": "Smartphone"}]
+        }
         self.p.play_from(0, self.tracks)
         self.assertTrue(wait_until(lambda: self.sp.calls_to("start_playback")))
         self.assertEqual(self.sp.calls_to("start_playback")[0]["device_id"], "devX")
@@ -331,10 +465,15 @@ class TestPlaybackCommands(unittest.TestCase):
         kw = self.sp.calls_to("transfer_playback")[0]
         self.assertEqual(kw, {"device_id": "devB", "force_play": True})
 
-    def test_cmd_translates_no_active_device(self):
+    def test_cmd_translates_no_active_device_without_opening_browser(self):
+        # the app must never launch a browser on its own — it points the
+        # user at [o]/[d] and lets them decide (trust beats magic)
         self.sp.raises["next_track"] = RuntimeError("NO_ACTIVE_DEVICE found")
-        self.p.next()
-        self.assertTrue(wait_until(lambda: "no active device" in self.p.error))
+        with mock.patch.object(lr, "open_url") as opener:
+            self.p.next()
+            self.assertTrue(wait_until(lambda: "no active device" in self.p.error))
+        self.assertIn("[o]", self.p.error)
+        opener.assert_not_called()
 
     def test_cmd_failure_reconciles_with_a_poll(self):
         # optimistic flip must be reverted promptly when the command fails,
@@ -374,23 +513,30 @@ class AppTestBase(unittest.TestCase):
         self.p.loading = False
         self.p.playback = playback
         # ö/Ä are NFD-decomposable so fold() strips them (ø would not be)
-        self.p.tracks = [{"uri": f"spotify:track:{i}",
-                          "name": f"Söng {i}", "artist": f"Ärtist {i}",
-                          "album": "", "ms": 1000,
-                          "key": lr.fold(f"Söng {i} Ärtist {i}")}
-                         for i in range(n_tracks)]
+        self.p.tracks = [
+            {
+                "uri": f"spotify:track:{i}",
+                "name": f"Söng {i}",
+                "artist": f"Ärtist {i}",
+                "album": "",
+                "ms": 1000,
+                "key": lr.fold(f"Söng {i} Ärtist {i}"),
+            }
+            for i in range(n_tracks)
+        ]
         return lr.App(None, self.p)  # scr unused outside draw paths
 
 
 class TestNavigation(AppTestBase):
     def test_down_up_and_clamping(self):
         import curses
+
         app = self.make_app(5)
         app.handle(curses.KEY_UP)
-        self.assertEqual(app.sel, 0)            # clamped at top
+        self.assertEqual(app.sel, 0)  # clamped at top
         for _ in range(10):
             app.handle(curses.KEY_DOWN)
-        self.assertEqual(app.sel, 4)            # clamped at bottom
+        self.assertEqual(app.sel, 4)  # clamped at bottom
         app.handle(ord("g"))
         self.assertEqual(app.sel, 0)
         app.handle(ord("G"))
@@ -398,6 +544,7 @@ class TestNavigation(AppTestBase):
 
     def test_page_keys_move_by_15(self):
         import curses
+
         app = self.make_app(40)
         app.handle(curses.KEY_NPAGE)
         self.assertEqual(app.sel, 15)
@@ -446,7 +593,7 @@ class TestSearch(AppTestBase):
         app.handle(KEY_ENTER)
         self.assertFalse(app.searching)
         self.assertEqual(app.query, "song 1")
-        app.handle(KEY_ESC)                     # normal-mode Esc clears
+        app.handle(KEY_ESC)  # normal-mode Esc clears
         self.assertEqual(app.query, "")
 
     def test_backspace_and_esc_inside_search(self):
@@ -460,16 +607,16 @@ class TestSearch(AppTestBase):
 
     def test_arrows_browse_filtered_list_while_searching(self):
         app = self.make_app(12)
-        self.type_query(app, "song 1")          # matches Söng 1, 10, 11
+        self.type_query(app, "song 1")  # matches Söng 1, 10, 11
         app.handle(curses.KEY_DOWN)
         self.assertEqual(app.sel, 1)
         app.handle(curses.KEY_DOWN)
-        app.handle(curses.KEY_DOWN)             # clamps at last match (idx 2)
+        app.handle(curses.KEY_DOWN)  # clamps at last match (idx 2)
         self.assertEqual(app.sel, 2)
         app.handle(curses.KEY_UP)
         self.assertEqual(app.sel, 1)
-        self.assertTrue(app.searching)          # still in search mode
-        app.handle(curses.KEY_PPAGE)            # page keys clamp too
+        self.assertTrue(app.searching)  # still in search mode
+        app.handle(curses.KEY_PPAGE)  # page keys clamp too
         self.assertEqual(app.sel, 0)
         app.handle(curses.KEY_NPAGE)
         self.assertEqual(app.sel, 2)
@@ -478,10 +625,10 @@ class TestSearch(AppTestBase):
         app = self.make_app(12)
         self.type_query(app, "song 1")
         first = app.visible_tracks()
-        self.assertIs(app.visible_tracks(), first)   # same query → cached
-        app.handle(ord("1"))                          # query changed
+        self.assertIs(app.visible_tracks(), first)  # same query → cached
+        app.handle(ord("1"))  # query changed
         self.assertIsNot(app.visible_tracks(), first)
-        with self.p.lock:                             # loader replaces list
+        with self.p.lock:  # loader replaces list
             self.p.tracks = list(self.p.tracks)
         stale = app.visible_tracks()
         self.assertIsNot(stale, first)
@@ -511,42 +658,47 @@ class TestSearch(AppTestBase):
         played = []
         self.p.play_from = lambda idx, lst: played.append((idx, len(lst)))
         self.type_query(app, "song 1")
-        app.handle(KEY_ENTER)                   # leave search
+        app.handle(KEY_ENTER)  # leave search
         app.handle(curses_down())
-        app.handle(KEY_ENTER)                   # play 2nd filtered track
+        app.handle(KEY_ENTER)  # play 2nd filtered track
         self.assertEqual(played, [(1, 3)])
 
 
 def curses_down():
     import curses
+
     return curses.KEY_DOWN
 
 
 class TestDevicePicker(AppTestBase):
     def test_d_opens_instantly_and_loads_in_background(self):
-        app = self.make_app(devices=[{"id": "d1", "name": "Mac",
-                                      "type": "Computer", "is_active": True}])
+        app = self.make_app(
+            devices=[{"id": "d1", "name": "Mac", "type": "Computer", "is_active": True}]
+        )
         app.handle(ord("d"))
-        self.assertTrue(app.device_mode)        # no waiting for the network
+        self.assertTrue(app.device_mode)  # no waiting for the network
         self.assertTrue(wait_until(lambda: app.device_list))
         self.assertFalse(app.device_loading)
         self.assertEqual(app.device_list[0]["id"], "d1")
 
     def test_inflight_guard_prevents_duplicate_fetch(self):
-        app = self.make_app(devices=[{"id": "d1", "name": "Mac",
-                                      "type": "Computer"}])
-        self.sp.devices_gate = threading.Event()    # block the fetch
-        app.handle(ord("d"))                        # opens + starts fetch
-        app.handle(ord("d"))                        # modal toggles closed
-        app.handle(ord("d"))                        # reopens; fetch in flight
+        app = self.make_app(devices=[{"id": "d1", "name": "Mac", "type": "Computer"}])
+        self.sp.devices_gate = threading.Event()  # block the fetch
+        app.handle(ord("d"))  # opens + starts fetch
+        app.handle(ord("d"))  # modal toggles closed
+        app.handle(ord("d"))  # reopens; fetch in flight
         self.sp.devices_gate.set()
         self.assertTrue(wait_until(lambda: not app.device_loading))
         self.assertEqual(len(self.sp.calls_to("devices")), 1)
 
     def test_enter_transfers_selected_device_and_closes(self):
-        app = self.make_app(playback=playing_state(),
-                            devices=[{"id": "d1", "name": "Mac", "type": "Computer"},
-                                     {"id": "d2", "name": "Phone", "type": "Smartphone"}])
+        app = self.make_app(
+            playback=playing_state(),
+            devices=[
+                {"id": "d1", "name": "Mac", "type": "Computer"},
+                {"id": "d2", "name": "Phone", "type": "Smartphone"},
+            ],
+        )
         self.p.playback = playing_state()
         app.handle(ord("d"))
         self.assertTrue(wait_until(lambda: len(app.device_list) == 2))
@@ -572,6 +724,7 @@ class TestDevicePicker(AppTestBase):
             app.handle(curses_down())
         self.assertEqual(app.device_sel, 1)
         import curses
+
         for _ in range(5):
             app.handle(curses.KEY_UP)
         self.assertEqual(app.device_sel, 0)
@@ -580,11 +733,13 @@ class TestDevicePicker(AppTestBase):
 class TestReload(AppTestBase):
     def test_r_reloads_likes_in_background(self):
         app = self.make_app(n_tracks=2)
-        self.sp.pages = [{"items": [{"track": mk_track(i)} for i in range(3)],
-                          "total": 3}]
+        self.sp.pages = [
+            {"items": [{"track": mk_track(i)} for i in range(3)], "total": 3}
+        ]
         app.handle(ord("r"))
-        self.assertTrue(wait_until(lambda: not self.p.loading and
-                                   len(self.p.tracks) == 3))
+        self.assertTrue(
+            wait_until(lambda: not self.p.loading and len(self.p.tracks) == 3)
+        )
 
 
 class TestPlayerSearch(unittest.TestCase):
@@ -613,13 +768,15 @@ class TestPlayerSearch(unittest.TestCase):
         self.assertEqual(sorted(c["offset"] for c in calls), [0, 10, 20, 30, 40])
         self.assertEqual({c["q"] for c in calls}, {"daft punk"})
         # pages land in offset order regardless of fetch concurrency
-        self.assertEqual([t["name"] for t in self.p.search_results],
-                         [f"Song {i}" for i in range(50)])
+        self.assertEqual(
+            [t["name"] for t in self.p.search_results], [f"Song {i}" for i in range(50)]
+        )
 
     def test_search_dedupes_repeats_across_pages(self):
         # Spotify search repeats tracks across adjacent pages; keep first
-        self.sp.search_items = [mk_track(i) for i in range(20)] + \
-                               [mk_track(i) for i in range(15, 45)]
+        self.sp.search_items = [mk_track(i) for i in range(20)] + [
+            mk_track(i) for i in range(15, 45)
+        ]
         self.p.search("x")
         self.assertTrue(wait_until(lambda: self.p.search_results is not None))
         uris = [t["uri"] for t in self.p.search_results]
@@ -639,6 +796,41 @@ class TestPlayerSearch(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.p.error))
         self.assertIn("search", self.p.error)
         self.assertFalse(self.p.search_loading)
+        self.assertIsNone(self.p.search_results)
+
+    def test_stale_search_cannot_overwrite_newer_results(self):
+        slow_gate = threading.Event()
+
+        class SlowOldSP(FakeSP):
+            def search(self, q, type="track", limit=10, offset=0):
+                if q == "old":
+                    slow_gate.wait(3)  # first search hangs
+                self.search_items = (
+                    [mk_track(1, name="Old")]
+                    if q == "old"
+                    else [mk_track(2, name="New")]
+                )
+                return super().search(q, type=type, limit=limit, offset=offset)
+
+        self.sp = SlowOldSP()
+        self.p = lr.Player(self.sp)
+        self.p.search("old")  # in flight, blocked
+        self.p.search("new")  # finishes first
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        self.assertEqual([t["name"] for t in self.p.search_results], ["New"])
+        slow_gate.set()  # stale search lands late
+        time.sleep(0.2)
+        self.assertEqual([t["name"] for t in self.p.search_results], ["New"])
+        self.assertFalse(self.p.search_loading)
+
+    def test_clear_search_discards_inflight_results(self):
+        self.sp.search_gate = threading.Event()
+        self.sp.search_items = [mk_track(1)]
+        self.p.search("x")  # blocked in flight
+        self.p.clear_search()  # user pressed Esc
+        self.sp.search_gate.set()  # response lands after Esc
+        self.assertTrue(wait_until(lambda: not self.p.search_loading))
+        time.sleep(0.1)
         self.assertIsNone(self.p.search_results)
 
     def test_clear_search_resets_results(self):
@@ -719,7 +911,9 @@ class TestGlobalSearch(AppTestBase):
         app = self.make_app()
         self.sp.search_items = [mk_track(90), mk_track(91)]
         played = []
-        self.p.play_from = lambda idx, lst: played.append((idx, [t["name"] for t in lst]))
+        self.p.play_from = lambda idx, lst: played.append(
+            (idx, [t["name"] for t in lst])
+        )
         self.search_for(app, "abba")
         self.assertTrue(wait_until(lambda: self.p.search_results is not None))
         app.handle(curses_down())
@@ -728,8 +922,7 @@ class TestGlobalSearch(AppTestBase):
 
     def test_slash_filter_narrows_results_locally(self):
         app = self.make_app()
-        self.sp.search_items = [
-            mk_track(1, name="Alpha"), mk_track(2, name="Beta")]
+        self.sp.search_items = [mk_track(1, name="Alpha"), mk_track(2, name="Beta")]
         self.search_for(app, "abba")
         self.assertTrue(wait_until(lambda: self.p.search_results is not None))
         app.handle(ord("/"))
@@ -744,8 +937,11 @@ class TestGlobalSearch(AppTestBase):
         self.assertTrue(wait_until(lambda: self.p.search_results is not None))
         self.sp.search_items = [mk_track(2), mk_track(3)]
         self.search_for(app, "two")
-        self.assertTrue(wait_until(
-            lambda: self.p.search_results and len(self.p.search_results) == 2))
+        self.assertTrue(
+            wait_until(
+                lambda: self.p.search_results and len(self.p.search_results) == 2
+            )
+        )
         self.assertEqual(self.sp.calls_to("search")[-1]["q"], "two")
 
 
@@ -768,11 +964,103 @@ class TestRunLoop(AppTestBase):
         app = self.make_app()
         app.scr = scr
         app.draw = lambda: None
-        with mock.patch.object(lr.curses, "curs_set"), \
-             mock.patch.object(lr.Pal, "init"):
+        with (
+            mock.patch.object(lr.curses, "curs_set"),
+            mock.patch.object(lr.Pal, "init"),
+        ):
             app.run()
 
         self.assertLessEqual(scr.timeouts[0], 50)
+
+
+class TestOpenInBrowser(AppTestBase):
+    def test_o_opens_selected_track_url(self):
+        app = self.make_app(5)
+        app.sel = 3
+        opened = []
+        with mock.patch.object(lr, "open_url", opened.append):
+            app.handle(ord("o"))
+            self.assertTrue(wait_until(lambda: opened))
+        self.assertEqual(opened, ["https://open.spotify.com/track/3"])
+        # a flash names the track so the keypress feels answered
+        self.assertIn("Söng 3", self.p.notice)
+
+    def test_o_respects_active_filter(self):
+        app = self.make_app(5)
+        app.query = "söng 2"  # visible_tracks shrinks to one
+        opened = []
+        with mock.patch.object(lr, "open_url", opened.append):
+            app.handle(ord("o"))
+            self.assertTrue(wait_until(lambda: opened))
+        self.assertEqual(opened, ["https://open.spotify.com/track/2"])
+
+    def test_o_with_no_tracks_is_a_noop(self):
+        app = self.make_app(0)
+        with mock.patch.object(lr, "open_url") as opener:
+            app.handle(ord("o"))
+            time.sleep(0.05)
+        opener.assert_not_called()
+
+    def test_open_url_prefers_chrome(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=0)
+
+        with (
+            mock.patch.object(lr.sys, "platform", "darwin"),
+            mock.patch.object(lr.subprocess, "run", fake_run),
+            mock.patch.object(lr.webbrowser, "open") as default,
+        ):
+            lr.open_url("https://open.spotify.com/track/x")
+        self.assertEqual(calls[0], ["open", "-Ra", "Google Chrome"])
+        self.assertEqual(
+            calls[1],
+            ["open", "-a", "Google Chrome", "https://open.spotify.com/track/x"],
+        )
+        default.assert_not_called()
+
+    def test_open_url_falls_back_without_chrome(self):
+        # `open -Ra` failing means Chrome is not installed
+        fake_run = mock.Mock(return_value=mock.Mock(returncode=1))
+        with (
+            mock.patch.object(lr.sys, "platform", "darwin"),
+            mock.patch.object(lr.subprocess, "run", fake_run),
+            mock.patch.object(lr.webbrowser, "open") as default,
+        ):
+            lr.open_url("https://open.spotify.com/track/x")
+        default.assert_called_once_with("https://open.spotify.com/track/x")
+
+    def test_open_url_linux_uses_webbrowser_get(self):
+        chrome = mock.Mock()
+        chrome.open.return_value = True
+
+        def get(name):
+            if name == "google-chrome":
+                return chrome
+            raise lr.webbrowser.Error(name)
+
+        with (
+            mock.patch.object(lr.sys, "platform", "linux"),
+            mock.patch.object(lr.webbrowser, "get", get),
+            mock.patch.object(lr.webbrowser, "open") as default,
+        ):
+            lr.open_url("https://open.spotify.com/track/x")
+        chrome.open.assert_called_once_with("https://open.spotify.com/track/x")
+        default.assert_not_called()
+
+    def test_open_url_linux_falls_back_without_chrome(self):
+        def get(name):
+            raise lr.webbrowser.Error(name)
+
+        with (
+            mock.patch.object(lr.sys, "platform", "linux"),
+            mock.patch.object(lr.webbrowser, "get", get),
+            mock.patch.object(lr.webbrowser, "open") as default,
+        ):
+            lr.open_url("https://open.spotify.com/track/x")
+        default.assert_called_once_with("https://open.spotify.com/track/x")
 
 
 if __name__ == "__main__":
