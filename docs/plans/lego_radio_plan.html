@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LEGO Radio × Raspberry Pi — Plan d'intégration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bungee&family=Archivo:wght@400;500;700;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --walnut:#221c14;
+  --walnut-2:#2c241a;
+  --olive:#43594c;
+  --olive-deep:#31453a;
+  --cream:#f2e8d5;
+  --cream-2:#e8dcc3;
+  --mustard:#e3a72f;
+  --red:#c92a1e;
+  --orange:#d96e30;
+  --ink:#26211a;
+  --dim:#8a7f6c;
+  --radius:14px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  background:var(--walnut);
+  background-image:
+    repeating-linear-gradient(90deg, rgba(0,0,0,.12) 0 2px, transparent 2px 9px),
+    radial-gradient(ellipse 120% 80% at 50% -10%, #3a3023 0%, var(--walnut) 60%);
+  color:var(--cream);
+  font-family:'Archivo',sans-serif;
+  line-height:1.6;
+  padding:48px 20px 90px;
+}
+.wrap{max-width:980px;margin:0 auto}
+
+/* ───────── radio front panel hero ───────── */
+.radio{
+  background:linear-gradient(180deg,var(--olive) 0%,var(--olive-deep) 100%);
+  border-radius:26px;
+  padding:14px;
+  box-shadow:0 30px 60px rgba(0,0,0,.55), inset 0 2px 0 rgba(255,255,255,.12);
+  animation:rise .8s cubic-bezier(.2,.8,.2,1) both;
+}
+.radio-face{
+  background:var(--cream);
+  border-radius:18px;
+  padding:38px 38px 30px;
+  color:var(--ink);
+  position:relative;
+  overflow:hidden;
+}
+.radio-face::after{ /* grain */
+  content:"";position:absolute;inset:0;pointer-events:none;opacity:.05;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.brand{
+  font-family:'Bungee',cursive;
+  font-size:clamp(30px,5.4vw,52px);
+  letter-spacing:.02em;
+  color:var(--red);
+  line-height:1.05;
+}
+.brand small{display:block;color:var(--olive-deep);font-size:.38em;letter-spacing:.28em;margin-top:6px}
+.sub{margin-top:14px;font-size:17px;max-width:560px;color:#4a4337;font-weight:500}
+
+/* dial */
+.dial{
+  margin-top:30px;
+  background:linear-gradient(180deg,#2a2a26,#171714);
+  border-radius:10px;
+  padding:16px 18px 12px;
+  box-shadow:inset 0 3px 10px rgba(0,0,0,.7);
+}
+.dial-scale{display:flex;justify-content:space-between;position:relative;padding-bottom:8px}
+.dial-scale::before{
+  content:"";position:absolute;left:0;right:0;top:50%;height:2px;
+  background:repeating-linear-gradient(90deg,var(--dim) 0 1px,transparent 1px 12px);
+}
+.freq{
+  font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mustard);
+  text-decoration:none;position:relative;padding-top:14px;text-align:center;
+  transition:color .2s,transform .2s;
+}
+.freq::before{content:"";position:absolute;top:0;left:50%;width:2px;height:10px;background:var(--mustard);transform:translateX(-50%)}
+.freq:hover{color:var(--orange);transform:translateY(-2px)}
+.freq b{display:block;font-size:14px;color:var(--cream)}
+.needle{height:3px;background:var(--red);width:34%;margin-top:8px;border-radius:2px;box-shadow:0 0 8px var(--red);animation:tune 6s ease-in-out infinite alternate}
+@keyframes tune{from{width:18%}to{width:82%}}
+
+/* grille + knobs row */
+.panel-row{display:flex;gap:26px;align-items:center;margin-top:26px;flex-wrap:wrap}
+.grille{
+  flex:1;min-width:240px;height:96px;border-radius:10px;
+  background:
+    radial-gradient(circle 3px at 8px 8px, #b9ad94 35%, transparent 36%) 0 0/16px 16px,
+    linear-gradient(180deg,#d8ccb2,#c9bda1);
+  box-shadow:inset 0 2px 8px rgba(0,0,0,.25);
+}
+.knob{
+  width:78px;height:78px;border-radius:50%;
+  background:radial-gradient(circle at 35% 30%, #5b5b55, #23231f 70%);
+  box-shadow:0 6px 14px rgba(0,0,0,.45), inset 0 2px 3px rgba(255,255,255,.25);
+  position:relative;flex-shrink:0;
+  transition:transform .6s cubic-bezier(.2,.8,.2,1);
+  cursor:pointer;
+}
+.knob:hover{transform:rotate(120deg)}
+.knob::after{content:"";position:absolute;top:8px;left:50%;width:4px;height:18px;background:var(--mustard);border-radius:2px;transform:translateX(-50%)}
+.knob span{
+  position:absolute;bottom:-24px;left:50%;transform:translateX(-50%);
+  font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.18em;color:#6c6253;white-space:nowrap;
+}
+
+/* decisions strip */
+.decisions{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:42px}
+.chip{
+  background:var(--walnut-2);border:1px solid #46402f;border-radius:10px;
+  padding:14px 16px;animation:rise .7s cubic-bezier(.2,.8,.2,1) both;
+}
+.chip:nth-child(1){animation-delay:.10s}.chip:nth-child(2){animation-delay:.18s}
+.chip:nth-child(3){animation-delay:.26s}.chip:nth-child(4){animation-delay:.34s}
+.chip:nth-child(5){animation-delay:.42s}
+.chip em{display:block;font-style:normal;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.2em;color:var(--mustard);text-transform:uppercase;margin-bottom:5px}
+.chip strong{font-size:14px;font-weight:700;color:var(--cream)}
+
+/* ───────── sections ───────── */
+section{margin-top:64px;animation:rise .8s .1s cubic-bezier(.2,.8,.2,1) both}
+h2{
+  font-family:'Bungee',cursive;font-size:clamp(20px,3vw,28px);
+  color:var(--mustard);display:flex;align-items:baseline;gap:14px;margin-bottom:20px;
+}
+h2 .fm{font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--red);letter-spacing:.1em}
+.card{
+  background:var(--cream);color:var(--ink);border-radius:var(--radius);
+  padding:28px 30px;box-shadow:0 14px 34px rgba(0,0,0,.4);
+}
+.card.dark{background:#181510;color:var(--cream-2);border:1px solid #3c3526}
+.card + .card{margin-top:18px}
+h3{font-size:17px;font-weight:900;margin:22px 0 8px;color:var(--red)}
+.card.dark h3{color:var(--mustard)}
+.card p{margin:8px 0}
+ul{padding-left:20px;margin:8px 0}
+li{margin:5px 0}
+table{width:100%;border-collapse:collapse;font-size:14.5px;margin:10px 0}
+th{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;text-align:left;color:#7d7363;border-bottom:2px solid var(--ink);padding:8px 10px}
+td{padding:9px 10px;border-bottom:1px solid #d6caaf;vertical-align:top}
+tr:last-child td{border-bottom:none}
+td:last-child,th:last-child{text-align:right;white-space:nowrap}
+table.left td:last-child,table.left th:last-child{text-align:left;white-space:normal}
+code,pre{font-family:'IBM Plex Mono',monospace}
+code{background:rgba(0,0,0,.08);padding:1px 6px;border-radius:5px;font-size:.88em}
+.card.dark code{background:rgba(255,255,255,.08)}
+pre{
+  background:#11100c;color:#cfe3c8;border-radius:10px;padding:18px 20px;
+  font-size:12.5px;line-height:1.55;overflow-x:auto;margin:12px 0;
+  border:1px solid #322c1e;box-shadow:inset 0 2px 12px rgba(0,0,0,.6);
+}
+pre .c{color:#7a8a6e}pre .y{color:var(--mustard)}pre .r{color:#e06054}
+
+/* phases */
+.phase{
+  display:grid;grid-template-columns:86px 1fr;gap:0;margin-top:14px;
+  background:var(--cream);color:var(--ink);border-radius:var(--radius);
+  overflow:hidden;box-shadow:0 10px 26px rgba(0,0,0,.35);
+}
+.phase-no{
+  background:var(--red);color:var(--cream);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;font-family:'Bungee',cursive;
+  font-size:26px;padding:14px 0;
+}
+.phase:nth-child(even) .phase-no{background:var(--olive-deep)}
+.phase-no small{font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:.2em;opacity:.85}
+.phase-body{padding:20px 26px}
+.phase-body h3{margin-top:0;color:var(--ink)}
+.phase-body p,.phase-body li{font-size:14.5px}
+
+/* controls mapping */
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+.ctl{background:var(--cream);color:var(--ink);border-radius:12px;padding:18px;border-top:6px solid var(--mustard);box-shadow:0 8px 20px rgba(0,0,0,.35)}
+.ctl:nth-child(2n){border-top-color:var(--red)}
+.ctl:nth-child(3n){border-top-color:var(--olive)}
+.ctl em{font-style:normal;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:#7d7363}
+.ctl strong{display:block;font-size:15px;margin-top:4px}
+
+footer{margin-top:80px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--dim);letter-spacing:.15em}
+@keyframes rise{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:none}}
+@media(max-width:600px){.phase{grid-template-columns:1fr}.phase-no{flex-direction:row;gap:10px;padding:10px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ════════ HERO : RADIO FACE ════════ -->
+  <div class="radio">
+    <div class="radio-face">
+      <div class="brand">LEGO RADIO<small>× RASPBERRY PI · PLAN D'INTÉGRATION · SET 10334</small></div>
+      <p class="sub">Transformer la radio rétro LEGO en vraie radio Spotify : un Pi Zero 2 W caché à l'intérieur, headless, son propre haut-parleur, pilotée par les boutons LEGO.</p>
+
+      <div class="dial">
+        <div class="dial-scale">
+          <a class="freq" href="#hw"><b>88</b>MATÉRIEL</a>
+          <a class="freq" href="#wiring"><b>92</b>CÂBLAGE</a>
+          <a class="freq" href="#soft"><b>98</b>LOGICIEL</a>
+          <a class="freq" href="#phases"><b>104</b>PHASES</a>
+          <a class="freq" href="#risk"><b>108</b>RISQUES</a>
+        </div>
+        <div class="needle"></div>
+      </div>
+
+      <div class="panel-row">
+        <div class="knob"><span>VOLUME / PLAY</span></div>
+        <div class="grille"></div>
+        <div class="knob"><span>TUNING / NEXT</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- decisions -->
+  <div class="decisions">
+    <div class="chip"><em>Audio</em><strong>Le Pi joue le son (raspotify + ampli I2S)</strong></div>
+    <div class="chip"><em>Écran</em><strong>Headless — aucun écran</strong></div>
+    <div class="chip"><em>Contrôles</em><strong>Encodeurs rotatifs derrière les boutons LEGO</strong></div>
+    <div class="chip"><em>Modèle</em><strong>Raspberry Pi Zero 2 W</strong></div>
+    <div class="chip"><em>Alimentation</em><strong>Câble USB à l'arrière, comme un cordon secteur</strong></div>
+  </div>
+
+  <!-- ════════ ARCHITECTURE ════════ -->
+  <section id="arch">
+    <h2><span class="fm">FM 86.0</span>Architecture</h2>
+    <div class="card dark">
+      <p>Deux processus indépendants tournent sur le Pi :</p>
+      <ul>
+        <li><strong style="color:var(--mustard)">raspotify</strong> (librespot packagé) : fait apparaître le Pi comme appareil <strong>Spotify Connect</strong> nommé « LEGO Radio ». Il gère tout le flux audio, survit aux reboots et aux coupures Wi-Fi.</li>
+        <li><strong style="color:var(--mustard)">lego_radio_gpio.py</strong> (nouveau daemon) : lit les encodeurs via <code>gpiozero</code> et appelle l'API Web Spotify (spotipy, PKCE — même auth que le TUI existant) en ciblant l'appareil « LEGO Radio ».</li>
+      </ul>
+<pre>
+                        ┌────────────────────────────────────┐
+                        │        <span class="y">LEGO Retro Radio 10334</span>      │
+                        │                                    │
+ Spotify Web API ◄──────┼── lego_radio_gpio.py (daemon)      │
+ (play/pause/next/vol)  │        ▲ gpiozero                  │
+                        │        │                           │
+                        │   2× encodeurs KY-040              │
+                        │   (derrière les boutons LEGO)      │
+                        │                                    │
+ Spotify Connect ───────┼─► raspotify (librespot)            │
+ (flux audio)           │        │ I2S                       │
+                        │   Ampli MAX98357A ──► HP 3W        │
+                        │                  (derrière grille) │
+                        │   Pi Zero 2 W ◄── 5V USB (arrière) │
+                        └────────────────────────────────────┘
+</pre>
+      <p>Le TUI <code>lego_radio.py</code> reste utilisable sur le bureau. Sa logique Spotify (auth PKCE, Liked Songs, contrôle de lecture) est extraite dans un module partagé <code>spotify_core.py</code> utilisé par les deux interfaces.</p>
+    </div>
+  </section>
+
+  <!-- ════════ MATÉRIEL ════════ -->
+  <section id="hw">
+    <h2><span class="fm">FM 88.0</span>Matériel · ~45–55 €</h2>
+    <div class="card">
+      <table>
+        <tr><th>Pièce</th><th>Rôle</th><th>Prix</th></tr>
+        <tr><td><strong>Raspberry Pi Zero 2 W</strong> + header soudé</td><td>le cerveau</td><td>22 €</td></tr>
+        <tr><td>Ampli I2S <strong>Adafruit MAX98357A</strong> 3W</td><td>sortie audio (le Zero n'en a pas)</td><td>6 €</td></tr>
+        <tr><td>Haut-parleur 4Ω / 3W, ~40–50 mm</td><td>derrière la grille LEGO</td><td>5 €</td></tr>
+        <tr><td>2× encodeurs rotatifs <strong>KY-040</strong> (avec poussoir)</td><td>boutons volume + tuning</td><td>5 €</td></tr>
+        <tr><td>MicroSD 16 Go+ (A1)</td><td>OS</td><td>8 €</td></tr>
+        <tr><td>Alim 5V / 2,5A USB + câble</td><td>« cordon secteur » à l'arrière</td><td>8 €</td></tr>
+        <tr><td>Fils Dupont, perfboard, gaine thermo</td><td>câblage</td><td>—</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- ════════ CÂBLAGE ════════ -->
+  <section id="wiring">
+    <h2><span class="fm">FM 92.0</span>Câblage</h2>
+    <div class="card">
+      <h3 style="margin-top:0">MAX98357A (I2S)</h3>
+      <table class="left">
+        <tr><th>Pin ampli</th><th>Pin Pi</th></tr>
+        <tr><td>VIN</td><td>5V (pin 2)</td></tr>
+        <tr><td>GND</td><td>GND (pin 6)</td></tr>
+        <tr><td>BCLK</td><td>GPIO 18 (pin 12)</td></tr>
+        <tr><td>LRC</td><td>GPIO 19 (pin 35)</td></tr>
+        <tr><td>DIN</td><td>GPIO 21 (pin 40)</td></tr>
+      </table>
+      <p>Haut-parleur sur le bornier à vis de l'ampli. GAIN non connecté (9 dB par défaut).</p>
+      <h3>Encodeurs</h3>
+      <table class="left">
+        <tr><th>Encodeur</th><th>CLK</th><th>DT</th><th>SW</th><th>Alim</th></tr>
+        <tr><td><strong>A — Volume</strong> (bouton gauche)</td><td>GPIO 5</td><td>GPIO 6</td><td>GPIO 13</td><td>3V3 + GND</td></tr>
+        <tr><td><strong>B — Tuning</strong> (bouton droit)</td><td>GPIO 16</td><td>GPIO 20</td><td>GPIO 26</td><td>3V3 + GND</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- ════════ CONTRÔLES ════════ -->
+  <section id="controls">
+    <h2><span class="fm">FM 95.0</span>Mapping des contrôles</h2>
+    <div class="controls">
+      <div class="ctl"><em>Volume · rotation</em><strong>Volume ± (API Spotify)</strong></div>
+      <div class="ctl"><em>Volume · pression</em><strong>Play / Pause</strong></div>
+      <div class="ctl"><em>Tuning · rotation</em><strong>Titre suivant / précédent</strong></div>
+      <div class="ctl"><em>Tuning · pression</em><strong>Re-shuffle des Liked Songs</strong></div>
+      <div class="ctl"><em>Tuning · appui long 3 s</em><strong>Extinction propre (poweroff)</strong></div>
+    </div>
+  </section>
+
+  <!-- ════════ LOGICIEL / PHASES ════════ -->
+  <section id="phases">
+    <h2><span class="fm">FM 104.0</span>Plan logiciel — 8 phases</h2>
+
+    <div class="phase"><div class="phase-no">0<small>PHASE</small></div><div class="phase-body">
+      <h3>Montage sur établi (sans LEGO)</h3>
+      <p>Tout est assemblé et testé sur le bureau d'abord. On ne « brique » qu'une fois le logiciel solide.</p>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">1<small>PHASE</small></div><div class="phase-body">
+      <h3>OS &amp; réseau</h3>
+      <ul>
+        <li>Raspberry Pi OS <strong>Lite 64-bit</strong> flashé avec Raspberry Pi Imager (hostname <code>legoradio</code>, SSH activé, Wi-Fi préconfiguré).</li>
+        <li>Boot → <code>ssh legoradio.local</code> → <code>apt update && apt full-upgrade</code>.</li>
+      </ul>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">2<small>PHASE</small></div><div class="phase-body">
+      <h3>Audio : raspotify</h3>
+<pre><span class="c"># /boot/firmware/config.txt</span>
+dtparam=audio=off
+dtoverlay=hifiberry-dac        <span class="c"># pilote le MAX98357A</span>
+
+<span class="c"># installation</span>
+curl -sL https://dtcooper.github.io/raspotify/install.sh | sh
+
+<span class="c"># /etc/raspotify/conf</span>
+LIBRESPOT_NAME=<span class="y">"LEGO Radio"</span>
+LIBRESPOT_BITRATE=<span class="y">"320"</span>
+LIBRESPOT_INITIAL_VOLUME=<span class="y">"40"</span></pre>
+      <p>Test : <code>speaker-test</code>, puis choisir « LEGO Radio » depuis l'app Spotify du téléphone.</p>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">3<small>PHASE</small></div><div class="phase-body">
+      <h3>Refactor du code (sur le Mac)</h3>
+      <ul>
+        <li>Extraire de <code>lego_radio.py</code> → <code>spotify_core.py</code> : config, auth PKCE + cache de tokens, pagination des Liked Songs, contrôle de lecture (play/pause/next/prev/volume/ciblage d'appareil).</li>
+        <li><code>lego_radio.py</code> garde l'UI curses et importe le core.</li>
+        <li>Nouveau <code>lego_radio_gpio.py</code> : handlers <code>gpiozero</code> RotaryEncoder/Button → appels au core. Débounce + file de travail pour que les appels API ne bloquent jamais les callbacks GPIO. Cible automatiquement « LEGO Radio » ; si rien ne joue, lance les Liked Songs en shuffle.</li>
+        <li>Tests sur l'extraction du core avec un client spotipy mocké (TDD).</li>
+      </ul>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">4<small>PHASE</small></div><div class="phase-body">
+      <h3>Auth sur le Pi (PKCE headless)</h3>
+      <p>La redirection OAuth va vers <code>127.0.0.1:8888</code> — pas de navigateur sur un Pi headless.</p>
+      <ul>
+        <li><strong>Choisi :</strong> s'autoriser une fois sur le Mac, puis copier <code>~/.config/lego_radio/</code> (config + cache de tokens) sur le Pi. spotipy rafraîchit ensuite les tokens tout seul.</li>
+        <li>Secours : <code>ssh -L 8888:127.0.0.1:8888 legoradio.local</code> et finir le flow depuis le navigateur du Mac.</li>
+      </ul>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">5<small>PHASE</small></div><div class="phase-body">
+      <h3>Services systemd</h3>
+      <ul>
+        <li><code>lego-radio-gpio.service</code> : daemon lancé en user normal, <code>Restart=always</code>, <code>After=network-online.target</code>.</li>
+        <li>Logs via journald : <code>journalctl -u lego-radio-gpio -f</code>.</li>
+        <li>Seul le cache de tokens est écrit ; overlayfs lecture seule en option plus tard (longévité SD).</li>
+      </ul>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">6<small>PHASE</small></div><div class="phase-body">
+      <h3>Intégration LEGO</h3>
+      <ul>
+        <li>Haut-parleur monté derrière la grille avant (panneau majoritairement ajouré — le son passe bien).</li>
+        <li>Accouplement des axes KY-040 aux boutons rotatifs du set : axe Technic + connecteur d'axe collé/emmanché sur l'axe en D de l'encodeur — les boutons du set tournent déjà librement.</li>
+        <li>Pi + perfboard au fond du corps de la radio (velcro ou cage en briques) ; câble USB sorti à l'arrière, comme un cordon secteur.</li>
+        <li>Quelques tenons ouverts près du Pi pour l'aération (le Zero 2 W chauffe à peine à cette charge).</li>
+      </ul>
+    </div></div>
+
+    <div class="phase"><div class="phase-no">7<small>PHASE</small></div><div class="phase-body">
+      <h3>Tests &amp; finitions</h3>
+      <ul>
+        <li><strong>Cold-boot :</strong> alimentation → « LEGO Radio » visible sur Connect en ≤ 30 s, boutons opérationnels sans aucune interaction.</li>
+        <li><strong>Coupure Wi-Fi :</strong> raspotify se reconnecte, le daemon réessaie avec backoff.</li>
+        <li><strong>Erreurs API :</strong> 429/5xx → backoff exponentiel, jamais de crash.</li>
+        <li><strong>Extinction par appui long</strong> vérifiée avant fermeture définitive (évite la corruption SD).</li>
+      </ul>
+    </div></div>
+  </section>
+
+  <!-- ════════ RISQUES ════════ -->
+  <section id="risk">
+    <h2><span class="fm">FM 108.0</span>Risques &amp; parades</h2>
+    <div class="card">
+      <table class="left">
+        <tr><th>Risque</th><th>Parade</th></tr>
+        <tr><td>Spotify Premium requis pour le contrôle Connect</td><td>Déjà requis par le TUI existant ; rien ne change</td></tr>
+        <tr><td>OAuth headless</td><td>Cache de tokens copié depuis le Mac ; auto-refresh spotipy</td></tr>
+        <tr><td>Rebonds / pas manqués des encodeurs</td><td>gpiozero RotaryEncoder + file d'appels API</td></tr>
+        <tr><td>Corruption SD sur coupure de courant</td><td>Extinction par appui long ; overlayfs en option</td></tr>
+        <tr><td>librespot disparaît de la liste d'appareils</td><td>Auto-restart systemd ; le daemon re-résout l'appareil par son nom</td></tr>
+        <tr><td>Rate limits API en tournant vite le bouton</td><td>Coalescence : seul le dernier état volume/piste est envoyé, ≥ 250 ms d'écart</td></tr>
+      </table>
+      <h3>Hors périmètre (YAGNI)</h3>
+      <p>Batterie, écran, web UI, multi-room, « stations » présélectionnées sur le cadran (le mécanisme de tuning s'y prêterait bien plus tard : présélections → playlists).</p>
+    </div>
+  </section>
+
+  <footer>LEGO RADIO × RASPBERRY PI · PLAN 2026-06-07 · ~45–55 € · 8 PHASES</footer>
+</div>
+</body>
+</html>
