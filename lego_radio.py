@@ -138,15 +138,16 @@ class Player:
                     if not t or not t.get("uri"):
                         continue
                     artist = ", ".join(a["name"] for a in t["artists"])
+                    album = (t.get("album") or {}).get("name", "")
                     items.append({
                         "uri": t["uri"],
                         "name": t["name"],
                         "artist": artist,
-                        "album": (t.get("album") or {}).get("name", ""),
+                        "album": album,
                         "ms": t.get("duration_ms", 0),
                         # precomputed search key — folding 400+ strings per
                         # frame while typing is what made search feel slow
-                        "key": fold(t["name"] + " " + artist),
+                        "key": fold(t["name"] + " " + artist + " " + album),
                     })
                 with self.lock:
                     self.tracks = list(items)
@@ -180,9 +181,11 @@ class Player:
         def run():
             try:
                 fn()
-                self.poll()        # fast confirmation…
+                # The optimistic UI update already happened; polling too
+                # early would read pre-command state and revert it. Wait
+                # for Spotify to apply the command, then reconcile once.
                 time.sleep(0.25)
-                self.poll()        # …then a settle pass once Spotify catches up
+                self.poll()
             except Exception as e:
                 msg = str(e)
                 if "NO_ACTIVE_DEVICE" in msg or "Device not found" in msg:
@@ -261,8 +264,13 @@ class Player:
             self.flag_error(f"devices: {e}")
             return []
 
-    def transfer(self, device_id):
-        self._cmd(lambda: self.sp.transfer_playback(device_id, force_play=True), "transfer")
+    def transfer(self, device):
+        with self.lock:  # optimistic: show the new device in the bar now
+            if self.playback and self.playback.get("device"):
+                self.playback["device"] = dict(
+                    self.playback["device"], id=device["id"], name=device["name"])
+        self._cmd(lambda: self.sp.transfer_playback(device["id"], force_play=True),
+                  "transfer")
 
     def _device_id(self):
         with self.lock:
@@ -353,6 +361,7 @@ class App:
         self.device_list = []
         self.device_sel = 0
         self.device_loading = False
+        self.all_keys = False  # footer: core keys by default, ? shows all
 
     # -- derived --
     def visible_tracks(self):
@@ -452,10 +461,14 @@ class App:
             dev = (pb.get("device") or {})
             vol = dev.get("volume_percent")
             artists = ", ".join(a["name"] for a in item.get("artists", []))
+            album = (item.get("album") or {}).get("name", "")
+            byline = f"— {clip(artists, w // 3)}"
+            if album and album != item["name"]:  # skip redundant single-titles
+                byline += f" · {clip(album, w // 4)}"
             put(self.scr, y + 1, 2, f"{icon} ", Pal.c(Pal.GREEN, bold=True))
             put(self.scr, y + 1, 4, clip(item["name"], w // 2), Pal.c(Pal.BRIGHT, bold=True))
             put(self.scr, y + 1, 5 + min(len(item["name"]), w // 2),
-                f"— {clip(artists, w // 3)}{shuffle}", Pal.c(Pal.DIM))
+                f"{byline}{shuffle}", Pal.c(Pal.DIM))
             right = f"{dev.get('name', '?')}  vol {vol if vol is not None else '–'}%"
             put(self.scr, y + 1, max(2, w - len(right) - 2), right, Pal.c(Pal.YELLOW))
             # progress bricks
@@ -479,13 +492,31 @@ class App:
     def draw_footer(self, y, w):
         if self.searching:
             put(self.scr, y, 0, f" / {self.query}▏", Pal.c(Pal.YELLOW, bold=True))
+            if self.query:
+                with self.p.lock:
+                    total = len(self.p.tracks)
+                count = f"{len(self.visible_tracks())} / {total} "
+                put(self.scr, y, max(0, w - len(count) - 1), count, Pal.c(Pal.DIM))
             return
-        keys = [("↑↓", "move"), ("⏎", "play"), ("space", "pause"),
-                ("n/p", "skip"), ("s", "shuffle"), ("+/-", "vol"),
-                ("/", "search"), ("d", "devices"), ("r", "reload"), ("q", "quit")]
+        if self.all_keys:
+            # ordered so a narrow terminal clips the already-learned
+            # navigation keys, never "? less" / "q quit"
+            keys = [("⏎", "play"), ("space", "pause"), ("n/p", "skip"),
+                    ("s", "shuffle"), ("+/-", "vol"), ("/", "search"),
+                    ("d", "devices"), ("r", "reload"), ("?", "less"),
+                    ("q", "quit"), ("↑↓/jk", "move"), ("g/G", "top/end")]
+        else:
+            keys = [("⏎", "play"), ("space", "pause"), ("n/p", "skip"),
+                    ("/", "search"), ("?", "more"), ("q", "quit")]
+        # active-filter marker, pinned right; keys never draw under it
+        kw = w
+        if self.query:
+            mark = f" ✂ {self.query} ({len(self.visible_tracks())}) "
+            kw = max(0, w - len(mark) - 1)
+            put(self.scr, y, kw, mark, Pal.c(Pal.YELLOW))
         x = 1
         for k, label in keys:
-            if x + len(k) + len(label) + 4 > w:
+            if x + len(k) + len(label) + 4 > kw:
                 break
             put(self.scr, y, x, f" {k} ", Pal.c(Pal.SEL, bold=True))
             put(self.scr, y, x + len(k) + 2, f"{label}  ", Pal.c(Pal.DIM))
@@ -556,6 +587,8 @@ class App:
             self.p.shuffle_toggle()
         elif ch == ord("/"):
             self.searching = True
+        elif ch == ord("?"):
+            self.all_keys = not self.all_keys
         elif ch == 27:  # Esc clears search filter
             self.query = ""
         elif ch == ord("d"):
@@ -597,7 +630,7 @@ class App:
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.device_sel = min(max(0, len(self.device_list) - 1), self.device_sel + 1)
         elif ch in (curses.KEY_ENTER, 10, 13) and self.device_list:
-            self.p.transfer(self.device_list[self.device_sel]["id"])
+            self.p.transfer(self.device_list[self.device_sel])
             self.device_mode = False
         return True
 
