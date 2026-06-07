@@ -476,6 +476,25 @@ class TestSearch(AppTestBase):
         self.assertIsNot(stale, first)
         self.assertEqual([t["name"] for t in stale], ["Söng 11"])
 
+    def test_filter_narrows_from_previous_results_when_query_extends(self):
+        class PoisonKey:
+            def __contains__(self, _needle):
+                raise AssertionError("extended search scanned unrelated tracks")
+
+        app = self.make_app(120)
+        app.query = "song 9"
+        previous = app.visible_tracks()
+        previous_uris = {t["uri"] for t in previous}
+
+        # Tracks that did not match "song 9" cannot match "song 99" either.
+        # If the extended query scans them again, this test fails.
+        for track in self.p.tracks:
+            if track["uri"] not in previous_uris:
+                track["key"] = PoisonKey()
+
+        app.query = "song 99"
+        self.assertEqual([t["name"] for t in app.visible_tracks()], ["Söng 99"])
+
     def test_enter_plays_from_filtered_list(self):
         app = self.make_app(12)
         played = []
@@ -555,6 +574,32 @@ class TestReload(AppTestBase):
         app.handle(ord("r"))
         self.assertTrue(wait_until(lambda: not self.p.loading and
                                    len(self.p.tracks) == 3))
+
+
+class TestRunLoop(AppTestBase):
+    def test_main_loop_uses_low_latency_input_timeout(self):
+        class FakeScreen:
+            def __init__(self):
+                self.timeouts = []
+
+            def timeout(self, ms):
+                self.timeouts.append(ms)
+
+            def nodelay(self, _flag):
+                pass
+
+            def getch(self):
+                return ord("q")
+
+        scr = FakeScreen()
+        app = self.make_app()
+        app.scr = scr
+        app.draw = lambda: None
+        with mock.patch.object(lr.curses, "curs_set"), \
+             mock.patch.object(lr.Pal, "init"):
+            app.run()
+
+        self.assertLessEqual(scr.timeouts[0], 50)
 
 
 if __name__ == "__main__":

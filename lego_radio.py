@@ -402,7 +402,7 @@ class App:
         self.device_sel = 0
         self.device_loading = False
         self.all_keys = False  # footer: core keys by default, ? shows all
-        self._vis_cache = None  # (tracks identity, query) -> filtered list
+        self._vis_cache = None  # (tracks identity, query, folded query, results)
 
     # -- derived --
     def visible_tracks(self):
@@ -413,11 +413,17 @@ class App:
         # memoized: draw() calls this several times per frame, and the
         # loader replaces p.tracks wholesale, so identity is a valid key
         cached = self._vis_cache
-        if cached and cached[0] is tracks and cached[1] == self.query:
-            return cached[2]
         q = fold(self.query)
-        vis = [t for t in tracks if q in t["key"]]
-        self._vis_cache = (tracks, self.query, vis)
+        source = tracks
+        if cached and cached[0] is tracks:
+            if cached[1] == self.query:
+                return cached[3]
+            # Typing makes the query stricter. Re-filtering the previous
+            # result set avoids scanning large libraries on every keystroke.
+            if cached[2] and q.startswith(cached[2]):
+                source = cached[3]
+        vis = [t for t in source if q in t["key"]]
+        self._vis_cache = (tracks, self.query, q, vis)
         return vis
 
     # -- drawing --
@@ -696,7 +702,7 @@ class App:
             curses.set_escdelay(25)  # default 1000ms makes Esc feel broken
         except AttributeError:
             pass
-        self.scr.timeout(100)  # background updates surface within ~100ms
+        self.scr.timeout(50)  # background updates surface within ~50ms
         Pal.init()
         running = True
         while running:
@@ -713,7 +719,7 @@ class App:
                     if ch == -1:
                         break
                     running = self.handle(ch)
-                self.scr.timeout(100)
+                self.scr.timeout(50)
 
 
 def main():
