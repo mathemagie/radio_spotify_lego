@@ -205,6 +205,30 @@ pre .c{color:#7a8a6e}pre .y{color:var(--mustard)}pre .r{color:#e06054}
 footer{margin-top:80px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--dim);letter-spacing:.15em}
 @keyframes rise{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:none}}
 @media(max-width:600px){.phase{grid-template-columns:1fr}.phase-no{flex-direction:row;gap:10px;padding:10px}}
+
+/* ───────── animated SVG equalizer in the grille ───────── */
+.grille{position:relative;overflow:hidden}
+.eq{position:absolute;inset:0;width:100%;height:100%}
+.eq rect{
+  transform-box:fill-box;transform-origin:bottom;
+  animation:eq 1s ease-in-out infinite alternate;
+}
+@keyframes eq{0%{transform:scaleY(.10)}100%{transform:scaleY(1)}}
+
+/* ───────── ON AIR transmitter badge (dial) ───────── */
+.dial{position:relative}
+.onair{
+  position:absolute;top:10px;right:14px;
+  display:flex;align-items:center;gap:6px;
+  font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.22em;
+  color:var(--red);font-weight:600;text-shadow:0 0 8px rgba(201,42,30,.4);
+}
+.onair .tx{flex-shrink:0}
+
+/* respect users who prefer no motion */
+@media(prefers-reduced-motion:reduce){
+  .radio,.chip,section,.needle,.eq rect{animation:none!important}
+}
 </style>
 </head>
 <body>
@@ -233,11 +257,34 @@ footer{margin-top:80px;text-align:center;font-family:'IBM Plex Mono',monospace;f
           <a class="freq" href="#risk"><b>108</b>RISQUES</a>
         </div>
         <div class="needle"></div>
+        <div class="onair">
+          <svg class="tx" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="2.6" fill="#c92a1e"/>
+            <circle cx="12" cy="12" r="4" fill="none" stroke="#c92a1e" stroke-width="1.6">
+              <animate attributeName="r" values="4;10" dur="1.8s" repeatCount="indefinite"/>
+              <animate attributeName="opacity" values=".9;0" dur="1.8s" repeatCount="indefinite"/>
+            </circle>
+            <circle cx="12" cy="12" r="4" fill="none" stroke="#c92a1e" stroke-width="1.6">
+              <animate attributeName="r" values="4;10" dur="1.8s" begin="0.9s" repeatCount="indefinite"/>
+              <animate attributeName="opacity" values=".9;0" dur="1.8s" begin="0.9s" repeatCount="indefinite"/>
+            </circle>
+          </svg>
+          ON AIR
+        </div>
       </div>
 
       <div class="panel-row">
         <div class="knob"><span>VOLUME / PLAY</span></div>
-        <div class="grille"></div>
+        <div class="grille">
+          <svg class="eq" viewBox="0 0 240 96" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#e3a72f"/>
+                <stop offset="1" stop-color="#31453a"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
         <div class="knob"><span>TUNING / NEXT</span></div>
       </div>
     </div>
@@ -436,5 +483,30 @@ LIBRESPOT_INITIAL_VOLUME=<span class="y">"40"</span></pre>
 
   <footer>LEGO RADIO × RASPBERRY PI · PLAN 2026-06-07 · ~45–55 € · 8 PHASES</footer>
 </div>
+
+<script>
+// Build the grille equalizer: thin bars that bounce at staggered tempos,
+// so the radio looks like it's playing. SVG <rect>s scaled via CSS.
+(function () {
+  var eq = document.querySelector(".eq");
+  if (!eq) return;
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  var SVGNS = "http://www.w3.org/2000/svg";
+  var n = 28, w = 240 / n;
+  for (var i = 0; i < n; i++) {
+    var r = document.createElementNS(SVGNS, "rect");
+    r.setAttribute("x", (i * w + 1).toFixed(2));
+    r.setAttribute("y", "0");
+    r.setAttribute("width", (w - 2).toFixed(2));
+    r.setAttribute("height", "96");
+    r.setAttribute("fill", "url(#eqg)");
+    r.setAttribute("rx", "1");
+    // vary tempo and phase per bar for an organic, non-uniform bounce
+    r.style.animationDuration = (0.55 + Math.random() * 0.95).toFixed(2) + "s";
+    r.style.animationDelay = (-Math.random() * 1.2).toFixed(2) + "s";
+    eq.appendChild(r);
+  }
+})();
+</script>
 </body>
 </html>
