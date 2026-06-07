@@ -47,6 +47,8 @@ class FakeSP:
         self.device_payload = {"devices": devices or []}
         self.raises = {}          # method name -> Exception to raise
         self.devices_gate = None  # threading.Event to block devices()
+        self.search_gate = None   # threading.Event to block search()
+        self.search_items = []    # full result list; search() slices pages
 
     def _hit(self, name, **kw):
         self.calls.append((name, kw))
@@ -91,6 +93,15 @@ class FakeSP:
             self.devices_gate.wait(3)
         self._hit("devices")
         return self.device_payload
+
+    def search(self, q, type="track", limit=10, offset=0):
+        if self.search_gate is not None:
+            self.search_gate.wait(3)
+        self._hit("search", q=q, type=type, limit=limit, offset=offset)
+        # dev-mode API rejects limit > 10 with 400 Invalid limit
+        if limit > 10:
+            raise RuntimeError("http status: 400 ... Invalid limit")
+        return {"tracks": {"items": self.search_items[offset:offset + limit]}}
 
 
 def playing_state(uri="spotify:track:x", is_playing=True, shuffle=False,
@@ -574,6 +585,168 @@ class TestReload(AppTestBase):
         app.handle(ord("r"))
         self.assertTrue(wait_until(lambda: not self.p.loading and
                                    len(self.p.tracks) == 3))
+
+
+class TestPlayerSearch(unittest.TestCase):
+    def setUp(self):
+        self.sp = FakeSP()
+        self.p = lr.Player(self.sp)
+
+    def test_search_queries_api_and_parses_tracks(self):
+        self.sp.search_items = [mk_track(1), mk_track(2)]
+        self.p.search("daft punk")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        results = self.p.search_results
+        self.assertEqual(len(results), 2)
+        # same shape as liked tracks, including the precomputed fold key
+        self.assertEqual(results[0]["name"], "Song 1")
+        self.assertEqual(results[0]["artist"], "Artist 1")
+        self.assertIn("song 1 artist 1", results[0]["key"])
+
+    def test_search_paginates_at_limit_10(self):
+        # dev-mode apps 400 on limit > 10, so 50 results = 5 pages of 10
+        self.sp.search_items = [mk_track(i) for i in range(50)]
+        self.p.search("daft punk")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        calls = self.sp.calls_to("search")
+        self.assertEqual({c["limit"] for c in calls}, {10})
+        self.assertEqual(sorted(c["offset"] for c in calls), [0, 10, 20, 30, 40])
+        self.assertEqual({c["q"] for c in calls}, {"daft punk"})
+        # pages land in offset order regardless of fetch concurrency
+        self.assertEqual([t["name"] for t in self.p.search_results],
+                         [f"Song {i}" for i in range(50)])
+
+    def test_search_dedupes_repeats_across_pages(self):
+        # Spotify search repeats tracks across adjacent pages; keep first
+        self.sp.search_items = [mk_track(i) for i in range(20)] + \
+                               [mk_track(i) for i in range(15, 45)]
+        self.p.search("x")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        uris = [t["uri"] for t in self.p.search_results]
+        self.assertEqual(len(uris), len(set(uris)))
+        self.assertEqual(len(uris), 45)
+
+    def test_search_loading_flag_during_fetch(self):
+        self.sp.search_gate = threading.Event()
+        self.p.search("x")
+        self.assertTrue(self.p.search_loading)
+        self.sp.search_gate.set()
+        self.assertTrue(wait_until(lambda: not self.p.search_loading))
+
+    def test_search_error_flags_and_clears_loading(self):
+        self.sp.raises["search"] = RuntimeError("boom")
+        self.p.search("x")
+        self.assertTrue(wait_until(lambda: self.p.error))
+        self.assertIn("search", self.p.error)
+        self.assertFalse(self.p.search_loading)
+        self.assertIsNone(self.p.search_results)
+
+    def test_clear_search_resets_results(self):
+        self.sp.search_items = [mk_track(1)]
+        self.p.search("x")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        self.p.clear_search()
+        self.assertIsNone(self.p.search_results)
+
+
+class TestGlobalSearch(AppTestBase):
+    def search_for(self, app, q):
+        app.handle(ord("f"))
+        for c in q:
+            app.handle(ord(c))
+        app.handle(KEY_ENTER)
+
+    def test_f_opens_global_input_and_typing_builds_query(self):
+        app = self.make_app()
+        app.handle(ord("f"))
+        self.assertTrue(app.global_searching)
+        for c in "abba":
+            app.handle(ord(c))
+        self.assertEqual(app.global_query, "abba")
+
+    def test_enter_fires_api_search_and_shows_results(self):
+        app = self.make_app(n_tracks=3)
+        self.sp.search_items = [mk_track(90), mk_track(91)]
+        self.search_for(app, "abba")
+        self.assertFalse(app.global_searching)  # input closes, results stay
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        names = [t["name"] for t in app.visible_tracks()]
+        self.assertEqual(names, ["Song 90", "Song 91"])
+
+    def test_enter_with_empty_query_searches_nothing(self):
+        app = self.make_app()
+        app.handle(ord("f"))
+        app.handle(KEY_ENTER)
+        time.sleep(0.05)
+        self.assertEqual(self.sp.calls_to("search"), [])
+        self.assertFalse(app.global_searching)
+
+    def test_typing_resets_selection(self):
+        app = self.make_app()
+        app.sel = 9
+        app.handle(ord("f"))
+        app.handle(ord("a"))
+        self.assertEqual(app.sel, 0)
+
+    def test_esc_inside_input_cancels_and_keeps_likes(self):
+        app = self.make_app(n_tracks=3)
+        app.handle(ord("f"))
+        app.handle(ord("a"))
+        app.handle(KEY_ESC)
+        self.assertFalse(app.global_searching)
+        self.assertEqual(app.global_query, "")
+        self.assertEqual(len(app.visible_tracks()), 3)
+
+    def test_backspace_edits_global_query(self):
+        app = self.make_app()
+        app.handle(ord("f"))
+        for c in "ab":
+            app.handle(ord(c))
+        app.handle(127)
+        self.assertEqual(app.global_query, "a")
+
+    def test_esc_in_normal_mode_clears_results_back_to_likes(self):
+        app = self.make_app(n_tracks=3)
+        self.sp.search_items = [mk_track(90)]
+        self.search_for(app, "abba")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        app.handle(KEY_ESC)
+        self.assertIsNone(self.p.search_results)
+        self.assertEqual(app.global_query, "")
+        self.assertEqual(len(app.visible_tracks()), 3)
+
+    def test_enter_plays_from_results_list(self):
+        app = self.make_app()
+        self.sp.search_items = [mk_track(90), mk_track(91)]
+        played = []
+        self.p.play_from = lambda idx, lst: played.append((idx, [t["name"] for t in lst]))
+        self.search_for(app, "abba")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        app.handle(curses_down())
+        app.handle(KEY_ENTER)
+        self.assertEqual(played, [(1, ["Song 90", "Song 91"])])
+
+    def test_slash_filter_narrows_results_locally(self):
+        app = self.make_app()
+        self.sp.search_items = [
+            mk_track(1, name="Alpha"), mk_track(2, name="Beta")]
+        self.search_for(app, "abba")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        app.handle(ord("/"))
+        for c in "beta":
+            app.handle(ord(c))
+        self.assertEqual([t["name"] for t in app.visible_tracks()], ["Beta"])
+
+    def test_new_search_replaces_previous_results(self):
+        app = self.make_app()
+        self.sp.search_items = [mk_track(1)]
+        self.search_for(app, "one")
+        self.assertTrue(wait_until(lambda: self.p.search_results is not None))
+        self.sp.search_items = [mk_track(2), mk_track(3)]
+        self.search_for(app, "two")
+        self.assertTrue(wait_until(
+            lambda: self.p.search_results and len(self.p.search_results) == 2))
+        self.assertEqual(self.sp.calls_to("search")[-1]["q"], "two")
 
 
 class TestRunLoop(AppTestBase):

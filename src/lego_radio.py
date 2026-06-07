@@ -128,6 +128,8 @@ class Player:
         self.poll_ts = 0.0
         self.error = ""
         self.error_ts = 0.0
+        self.search_results = None  # None = inactive; list = global results
+        self.search_loading = False
 
     # -- liked songs --
     @staticmethod
@@ -178,6 +180,44 @@ class Player:
         finally:
             with self.lock:
                 self.loading = False
+
+    # -- global catalog search --
+    def search(self, query):
+        with self.lock:
+            self.search_loading = True
+
+        def run():
+            try:
+                # dev-mode apps 400 on limit > 10 (docs still say 50), so
+                # fetch 5 pages of 10 concurrently — same trick as load_likes
+                def fetch(off):
+                    res = self.sp.search(q=query, type="track",
+                                         limit=10, offset=off)
+                    return (res.get("tracks") or {}).get("items") or []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                    pages = list(ex.map(fetch, range(0, 50, 10)))
+                # search repeats tracks across adjacent pages — keep first
+                items, seen = [], set()
+                for t in (t for page in pages for t in page):
+                    uri = t.get("uri")
+                    if uri and uri not in seen:
+                        seen.add(uri)
+                        items.append(t)
+                # search returns bare track dicts; _parse_page expects the
+                # saved-tracks {"track": t} wrapper, so adapt and reuse it
+                parsed = self._parse_page({"items": [{"track": t} for t in items]})
+                with self.lock:
+                    self.search_results = parsed
+            except Exception as e:
+                self.flag_error(f"search: {e}")
+            finally:
+                with self.lock:
+                    self.search_loading = False
+        threading.Thread(target=run, daemon=True).start()
+
+    def clear_search(self):
+        with self.lock:
+            self.search_results = None
 
     # -- playback polling --
     def poll(self):
@@ -396,6 +436,8 @@ class App:
         self.top = 0
         self.query = ""
         self.searching = False
+        self.global_query = ""
+        self.global_searching = False
         self.spin = 0
         self.device_mode = False
         self.device_list = []
@@ -407,7 +449,9 @@ class App:
     # -- derived --
     def visible_tracks(self):
         with self.p.lock:
-            tracks = self.p.tracks
+            # global results replace likes while active; / filters either
+            tracks = self.p.search_results \
+                if self.p.search_results is not None else self.p.tracks
         if not self.query:
             return tracks
         # memoized: draw() calls this several times per frame, and the
@@ -450,7 +494,14 @@ class App:
             Pal.c(Pal.HEAD, bold=True))
         with self.p.lock:
             n, loading, cnt = len(self.p.tracks), self.p.loading, self.p.load_count
-        if loading:
+            results, searching = self.p.search_results, self.p.search_loading
+        if searching:
+            spin = SPINNER[self.spin % len(SPINNER)]
+            put(self.scr, 1, w - 22, f"{spin} searching…", Pal.c(Pal.GREEN))
+        elif results is not None:
+            label = f"⌕ {len(results)} results"
+            put(self.scr, 1, w - len(label) - 2, label, Pal.c(Pal.GREEN, bold=True))
+        elif loading:
             spin = SPINNER[self.spin % len(SPINNER)]
             put(self.scr, 1, w - 22, f"{spin} syncing {cnt}…", Pal.c(Pal.GREEN))
         else:
@@ -473,8 +524,14 @@ class App:
         cur_uri = ((pb or {}).get("item") or {}).get("uri")
 
         if not tracks:
-            msg = "no matches — Esc to clear search" if self.query else \
-                  "♥ your liked songs will appear here…"
+            with self.p.lock:
+                results = self.p.search_results
+            if self.query:
+                msg = "no matches — Esc to clear search"
+            elif results is not None:
+                msg = "no results — Esc for likes, f to search again"
+            else:
+                msg = "♥ your liked songs will appear here…"
             put(self.scr, top + 2, 4, msg, Pal.c(Pal.DIM))
         for i in range(rows):
             idx = self.top + i
@@ -544,6 +601,10 @@ class App:
             put(self.scr, y + 3, 2, f"✗ {err}", Pal.c(Pal.RED, bold=True))
 
     def draw_footer(self, y, w):
+        if self.global_searching:
+            put(self.scr, y, 0, f" ⌕ {self.global_query}▏ (all Spotify — ⏎ search)",
+                Pal.c(Pal.YELLOW, bold=True))
+            return
         if self.searching:
             put(self.scr, y, 0, f" / {self.query}▏", Pal.c(Pal.YELLOW, bold=True))
             if self.query:
@@ -557,11 +618,13 @@ class App:
             # navigation keys, never "? less" / "q quit"
             keys = [("⏎", "play"), ("space", "pause"), ("n/p", "skip"),
                     ("s", "shuffle"), ("+/-", "vol"), ("/", "search"),
-                    ("d", "devices"), ("r", "reload"), ("?", "less"),
-                    ("q", "quit"), ("↑↓/jk", "move"), ("g/G", "top/end")]
+                    ("f", "find all"), ("d", "devices"), ("r", "reload"),
+                    ("?", "less"), ("q", "quit"), ("↑↓/jk", "move"),
+                    ("g/G", "top/end")]
         else:
             keys = [("⏎", "play"), ("space", "pause"), ("n/p", "skip"),
-                    ("/", "search"), ("?", "more"), ("q", "quit")]
+                    ("/", "search"), ("f", "find all"), ("?", "more"),
+                    ("q", "quit")]
         # active-filter marker, pinned right; keys never draw under it
         kw = w
         if self.query:
@@ -609,6 +672,8 @@ class App:
             return self.handle_devices(ch)
         if self.searching:
             return self.handle_search(ch)
+        if self.global_searching:
+            return self.handle_global(ch)
         tracks = self.visible_tracks()
         if ch in (ord("q"),):
             return False
@@ -641,10 +706,17 @@ class App:
             self.p.shuffle_toggle()
         elif ch == ord("/"):
             self.searching = True
+        elif ch == ord("f"):
+            self.global_searching = True
+            self.global_query = ""
         elif ch == ord("?"):
             self.all_keys = not self.all_keys
-        elif ch == 27:  # Esc clears search filter
-            self.query = ""
+        elif ch == 27:  # Esc clears search filter, then global results
+            if self.query:
+                self.query = ""
+            else:
+                self.global_query = ""
+                self.p.clear_search()
         elif ch == ord("d"):
             # open instantly; fetch in background — sp.devices() is a
             # network call and must never run on the UI thread
@@ -680,6 +752,22 @@ class App:
             self.sel = max(0, min(self.sel + step, last))
         elif 32 <= ch < 256:
             self.query += chr(ch)
+            self.sel, self.top = 0, 0
+        return True
+
+    def handle_global(self, ch):
+        if ch == 27:
+            self.global_searching, self.global_query = False, ""
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            self.global_searching = False
+            if self.global_query.strip():
+                self.query = ""          # results arrive unfiltered
+                self.sel, self.top = 0, 0
+                self.p.search(self.global_query)
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.global_query = self.global_query[:-1]
+        elif 32 <= ch < 256:
+            self.global_query += chr(ch)
             self.sel, self.top = 0, 0
         return True
 

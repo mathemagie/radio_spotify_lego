@@ -10,17 +10,17 @@ LEGO Radio — a single-file Python curses TUI (`lego_radio.py`) that plays the 
 
 ```bash
 .venv/bin/pip install -r requirements.txt   # only dependency: spotipy
-.venv/bin/python lego_radio.py              # run the app
-.venv/bin/python -m unittest -v             # run the test suite (test_lego_radio.py)
-.venv/bin/python -m unittest test_lego_radio.TestSearch -v   # one test class
-.venv/bin/python -m py_compile lego_radio.py  # syntax check
+.venv/bin/python src/lego_radio.py          # run the app
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v   # run the test suite (tests/test_lego_radio.py)
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_lego_radio.TestSearch -v   # one test class
+.venv/bin/python -m py_compile src/lego_radio.py  # syntax check
 ```
 
 Tests are stdlib `unittest` only (no pytest — keep it dependency-free). They never initialize curses: `App(None, player)` is fine as long as draw paths aren't touched. The Spotify client is replaced by `FakeSP` (records calls, raises on demand, can gate `devices()` on an Event); command threads are real, so tests synchronize on observable effects with `wait_until()`. Curses draw paths are covered separately by a pty smoke test: instantiate `Player` with a fake `sp`, populate `player.tracks` / `player.playback`, then drive `App.draw()` / `App.handle(ch)` under `curses.initscr()`. `curses.wrapper` cleanup fails without a real tty — catch `curses.error` around `endwin()` in sandboxed runs.
 
 ## Architecture
 
-Everything lives in `lego_radio.py`, in four layers (top to bottom of file):
+Everything lives in `src/lego_radio.py`, in four layers (top to bottom of file):
 
 1. **Config + first-run wizard** — plain-ANSI (not curses) prompts before the TUI starts. Saves `{client_id}` to `~/.config/lego_radio/config.json`; token cache lives beside it. Auth is spotipy `SpotifyPKCE` (Client ID only, no secret). The redirect URI `http://127.0.0.1:8888/callback` is hardcoded in `REDIRECT_URI` and must match the user's Spotify dashboard app exactly.
 2. **`Player`** — all Spotify state + API calls, shared across threads behind `self.lock`. Three thread types: a likes loader (`load_likes`, paginates 50 at a time, updates `tracks` incrementally so the UI fills in live), a 2.5s playback poll loop, and fire-and-forget command threads via `_cmd()` which translate API errors (`NO_ACTIVE_DEVICE`, `PREMIUM_REQUIRED`) into user-friendly `error` strings shown for 6s. UI code must never call the Spotify API synchronously.

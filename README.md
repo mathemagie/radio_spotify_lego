@@ -11,7 +11,7 @@ required for playback control (a Spotify API rule).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python lego_radio.py
+.venv/bin/python src/lego_radio.py
 ```
 
 ## First-run setup (≈2 minutes, free)
