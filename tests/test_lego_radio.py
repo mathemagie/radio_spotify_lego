@@ -113,6 +113,12 @@ class FakeSP:
     def transfer_playback(self, device_id, force_play=False):
         self._hit("transfer_playback", device_id=device_id, force_play=force_play)
 
+    def current_user_saved_tracks_add(self, tracks):
+        self._hit("current_user_saved_tracks_add", tracks=tracks)
+
+    def current_user_saved_tracks_delete(self, tracks):
+        self._hit("current_user_saved_tracks_delete", tracks=tracks)
+
     def devices(self):
         if self.devices_gate is not None:
             self.devices_gate.wait(3)
@@ -745,6 +751,74 @@ class TestReload(AppTestBase):
         app.handle(ord("r"))
         self.assertTrue(
             wait_until(lambda: not self.p.loading and len(self.p.tracks) == 3)
+        )
+
+
+class TestToggleLike(AppTestBase):
+    def _search_track(self, suffix="new"):
+        uri = f"spotify:track:{suffix}"
+        return {
+            "uri": uri,
+            "name": "Fresh Find",
+            "artist": "Someone",
+            "album": "",
+            "ms": 1000,
+            "key": lr.fold("Fresh Find Someone"),
+        }
+
+    def test_like_adds_unliked_track_to_top(self):
+        app = self.make_app(3)
+        track = self._search_track()
+        self.assertFalse(self.p.is_liked(track["uri"]))
+        app.p.toggle_like(track)
+        # optimistic: lands on top immediately
+        self.assertEqual(self.p.tracks[0]["uri"], "spotify:track:new")
+        self.assertIn("♥ added", self.p.notice)
+        self.assertTrue(
+            wait_until(lambda: self.sp.calls_to("current_user_saved_tracks_add"))
+        )
+        kw = self.sp.calls_to("current_user_saved_tracks_add")[0]
+        self.assertEqual(kw, {"tracks": ["new"]})
+
+    def test_unlike_removes_liked_track(self):
+        app = self.make_app(3)
+        track = self.p.tracks[1]  # already liked
+        app.p.toggle_like(track)
+        self.assertNotIn(track["uri"], [t["uri"] for t in self.p.tracks])
+        self.assertIn("♡ removed", self.p.notice)
+        self.assertTrue(
+            wait_until(lambda: self.sp.calls_to("current_user_saved_tracks_delete"))
+        )
+        self.assertEqual(
+            self.sp.calls_to("current_user_saved_tracks_delete")[0], {"tracks": ["1"]}
+        )
+
+    def test_failed_like_reverts_optimistic_add(self):
+        app = self.make_app(3)
+        self.sp.raises["current_user_saved_tracks_add"] = RuntimeError("boom")
+        track = self._search_track()
+        app.p.toggle_like(track)
+        self.assertTrue(wait_until(lambda: "like:" in self.p.error))
+        # the optimistic add must be undone
+        self.assertNotIn("spotify:track:new", [t["uri"] for t in self.p.tracks])
+
+    def test_failed_unlike_restores_track(self):
+        app = self.make_app(3)
+        self.sp.raises["current_user_saved_tracks_delete"] = RuntimeError("boom")
+        track = self.p.tracks[1]
+        app.p.toggle_like(track)
+        self.assertTrue(wait_until(lambda: "like:" in self.p.error))
+        self.assertIn(track["uri"], [t["uri"] for t in self.p.tracks])
+
+    def test_a_key_toggles_selected_track(self):
+        app = self.make_app(3)
+        app.sel = 2
+        app.handle(ord("a"))
+        self.assertTrue(
+            wait_until(lambda: self.sp.calls_to("current_user_saved_tracks_delete"))
+        )
+        self.assertEqual(
+            self.sp.calls_to("current_user_saved_tracks_delete")[0], {"tracks": ["2"]}
         )
 
 

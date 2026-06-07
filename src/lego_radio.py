@@ -35,7 +35,7 @@ LIKES_CACHE_FILE = os.path.join(CONFIG_DIR, "likes_cache.json")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 REDIRECT_URI = "http://127.0.0.1:8888/callback"
 SCOPES = (
-    "user-library-read user-read-playback-state "
+    "user-library-read user-library-modify user-read-playback-state "
     "user-modify-playback-state user-read-currently-playing"
 )
 
@@ -416,6 +416,52 @@ class Player:
                 self.playback["shuffle_state"] = not cur
         self._cmd(lambda: self.sp.shuffle(not cur), "shuffle")
 
+    def is_liked(self, uri):
+        with self.lock:
+            return any(t["uri"] == uri for t in self.tracks)
+
+    def toggle_like(self, track):
+        """Add/remove a track from Liked Songs, optimistically.
+
+        The in-memory likes list is the source of truth — a track is liked
+        iff its uri is in self.tracks — so no extra API round-trip is needed
+        to know which way to toggle. The list updates immediately (newly
+        liked songs land on top, as Spotify orders them) and reverts if the
+        API call fails.
+        """
+        uri = track["uri"]
+        tid = uri.rsplit(":", 1)[-1]
+        with self.lock:
+            idx = next((i for i, t in enumerate(self.tracks) if t["uri"] == uri), None)
+            liked = idx is not None
+            if liked:
+                removed = self.tracks.pop(idx)
+            else:
+                entry = {
+                    k: track.get(k)
+                    for k in ("uri", "name", "artist", "album", "ms", "key")
+                }
+                self.tracks.insert(0, entry)
+        self.flag_notice(
+            ("♡ removed " if liked else "♥ added ") + clip(track["name"], 40)
+        )
+
+        def run():
+            try:
+                if liked:
+                    self.sp.current_user_saved_tracks_delete(tracks=[tid])
+                else:
+                    self.sp.current_user_saved_tracks_add(tracks=[tid])
+            except Exception as e:
+                with self.lock:  # API rejected it — undo the optimistic change
+                    if liked:
+                        self.tracks.insert(min(idx, len(self.tracks)), removed)
+                    else:
+                        self.tracks[:] = [t for t in self.tracks if t["uri"] != uri]
+                self.flag_error(f"like: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+
     def devices(self):
         try:
             return self.sp.devices().get("devices", [])
@@ -712,9 +758,13 @@ class App:
             self.top = self.sel - rows + 1
         self.top = max(0, min(self.top, max(0, len(tracks) - rows)))
 
+        # while browsing search results, mark the ones already in Liked Songs
+        with self.p.lock:
+            results = self.p.search_results
+            liked_uris = (
+                {t["uri"] for t in self.p.tracks} if results is not None else None
+            )
         if not tracks:
-            with self.p.lock:
-                results = self.p.search_results
             if self.query:
                 msg = "no matches — Esc to clear search"
             elif results is not None:
@@ -730,7 +780,8 @@ class App:
             y = top + i
             is_sel = idx == self.sel
             is_cur = t["uri"] == cur_uri
-            marker = "▶ " if is_cur else "  "
+            is_liked = liked_uris is not None and t["uri"] in liked_uris
+            marker = "▶ " if is_cur else ("♥ " if is_liked else "  ")
             num = f"{idx + 1:>4} "
             dur = f" {fmt_ms(t['ms']):>5} "
             name_w = max(10, int((w - 14) * 0.55))
@@ -846,6 +897,7 @@ class App:
                 ("·", ""),
                 ("/", "search"),
                 ("f", "find all"),
+                ("a", "♥like"),
                 ("o", "↗track"),
                 ("d", "devices"),
                 ("r", "reload"),
@@ -972,6 +1024,9 @@ class App:
             self.p.volume(-10)
         elif ch == ord("s"):
             self.p.shuffle_toggle()
+        elif ch == ord("a"):
+            if tracks:
+                self.p.toggle_like(tracks[self.sel])
         elif ch == ord("o"):
             if tracks:
                 # spotify:track:ID → https://open.spotify.com/track/ID
