@@ -66,6 +66,23 @@ body{
 .brand small{display:block;color:var(--olive-deep);font-size:.38em;letter-spacing:.28em;margin-top:6px}
 .sub{margin-top:14px;font-size:17px;max-width:560px;color:#4a4337;font-weight:500}
 
+/* set photo */
+.hero-top{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap}
+.hero-top>div:first-child{flex:1;min-width:260px}
+.set-photo{
+  width:200px;flex-shrink:0;border-radius:12px;
+  background:var(--cream-2);
+  border:3px solid var(--olive-deep);
+  box-shadow:0 10px 24px rgba(0,0,0,.25);
+  transform:rotate(2deg);
+}
+.set-photo img{display:block;width:100%;border-radius:9px}
+.set-photo figcaption{
+  font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.18em;
+  text-transform:uppercase;color:#7d7363;text-align:center;padding:6px 4px 8px;
+}
+@media(max-width:600px){.set-photo{margin:0 auto;transform:none}}
+
 /* dial */
 .dial{
   margin-top:30px;
@@ -196,8 +213,16 @@ footer{margin-top:80px;text-align:center;font-family:'IBM Plex Mono',monospace;f
   <!-- ════════ HERO : RADIO FACE ════════ -->
   <div class="radio">
     <div class="radio-face">
-      <div class="brand">LEGO RADIO<small>× RASPBERRY PI · PLAN D'INTÉGRATION · SET 10334</small></div>
-      <p class="sub">Transformer la radio rétro LEGO en vraie radio Spotify : un Pi Zero 2 W caché à l'intérieur, headless, son propre haut-parleur, pilotée par les boutons LEGO.</p>
+      <div class="hero-top">
+        <div>
+          <div class="brand">LEGO RADIO<small>× RASPBERRY PI · PLAN D'INTÉGRATION · SET 10334</small></div>
+          <p class="sub">Transformer la radio rétro LEGO en vraie radio Spotify : un Pi Zero 2 W caché à l'intérieur, headless, son propre haut-parleur, pilotée par les boutons LEGO.</p>
+        </div>
+        <figure class="set-photo">
+          <img src="https://www.lego.com/cdn/cs/set/assets/blt429843c3c3c643b5/10334.png?format=webply&amp;fit=bounds&amp;quality=60&amp;width=800&amp;height=800&amp;dpr=2" alt="LEGO Retro Radio — set 10334">
+          <figcaption>LEGO® 10334 · Retro Radio</figcaption>
+        </figure>
+      </div>
 
       <div class="dial">
         <div class="dial-scale">
