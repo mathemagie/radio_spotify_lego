@@ -7,6 +7,7 @@ test, see CLAUDE.md). Command threads are real — tests synchronize on their
 observable effects with wait_until().
 """
 
+import curses
 import os
 import tempfile
 import threading
@@ -409,6 +410,22 @@ class TestSearch(AppTestBase):
         app.handle(KEY_ESC)
         self.assertFalse(app.searching)
         self.assertEqual(app.query, "")
+
+    def test_arrows_browse_filtered_list_while_searching(self):
+        app = self.make_app(12)
+        self.type_query(app, "song 1")          # matches Söng 1, 10, 11
+        app.handle(curses.KEY_DOWN)
+        self.assertEqual(app.sel, 1)
+        app.handle(curses.KEY_DOWN)
+        app.handle(curses.KEY_DOWN)             # clamps at last match (idx 2)
+        self.assertEqual(app.sel, 2)
+        app.handle(curses.KEY_UP)
+        self.assertEqual(app.sel, 1)
+        self.assertTrue(app.searching)          # still in search mode
+        app.handle(curses.KEY_PPAGE)            # page keys clamp too
+        self.assertEqual(app.sel, 0)
+        app.handle(curses.KEY_NPAGE)
+        self.assertEqual(app.sel, 2)
 
     def test_filter_result_is_memoized_per_query_and_tracks(self):
         app = self.make_app(12)

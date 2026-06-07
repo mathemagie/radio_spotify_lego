@@ -627,6 +627,13 @@ class App:
             self.searching = False
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             self.query = self.query[:-1]
+        elif ch in (curses.KEY_UP, curses.KEY_DOWN,
+                    curses.KEY_PPAGE, curses.KEY_NPAGE):
+            # browse results without leaving the search box (fzf-style)
+            step = {curses.KEY_UP: -1, curses.KEY_DOWN: 1,
+                    curses.KEY_PPAGE: -15, curses.KEY_NPAGE: 15}[ch]
+            last = max(0, len(self.visible_tracks()) - 1)
+            self.sel = max(0, min(self.sel + step, last))
         elif 32 <= ch < 256:
             self.query += chr(ch)
             self.sel, self.top = 0, 0
