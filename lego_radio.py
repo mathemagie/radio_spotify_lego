@@ -180,8 +180,9 @@ class Player:
         def run():
             try:
                 fn()
-                time.sleep(0.3)
-                self.poll()
+                self.poll()        # fast confirmation…
+                time.sleep(0.25)
+                self.poll()        # …then a settle pass once Spotify catches up
             except Exception as e:
                 msg = str(e)
                 if "NO_ACTIVE_DEVICE" in msg or "Device not found" in msg:
@@ -195,11 +196,13 @@ class Player:
         chunk = [t["uri"] for t in track_list[idx:idx + 100]]
         if not chunk:
             return
-        dev = self._device_id()
         with self.lock:
             shuffled = bool(self.playback and self.playback.get("shuffle_state"))
 
         def start():
+            # _device_id() may hit the network — must run here in the
+            # worker thread, never on the UI thread.
+            dev = self._device_id()
             # An explicit ⏎ means "play THIS track" — shuffle would make
             # Spotify pick a random one from the chunk, so disable it first.
             if shuffled:
@@ -222,22 +225,33 @@ class Player:
             self._cmd(lambda: self.sp.start_playback(), "resume")
 
     def next(self):
+        with self.lock:  # optimistic: reset the bar so the skip is visible now
+            if self.playback:
+                self.playback["progress_ms"] = 0
+                self.poll_ts = time.monotonic()
         self._cmd(lambda: self.sp.next_track(), "next")
 
     def prev(self):
+        with self.lock:
+            if self.playback:
+                self.playback["progress_ms"] = 0
+                self.poll_ts = time.monotonic()
         self._cmd(lambda: self.sp.previous_track(), "prev")
 
     def volume(self, delta):
         with self.lock:
             pb = self.playback
-        if not pb or not pb.get("device"):
-            return
-        vol = max(0, min(100, (pb["device"].get("volume_percent") or 50) + delta))
+            if not pb or not pb.get("device"):
+                return
+            vol = max(0, min(100, (pb["device"].get("volume_percent") or 50) + delta))
+            pb["device"]["volume_percent"] = vol  # optimistic: show new % now
         self._cmd(lambda: self.sp.volume(vol), "volume")
 
     def shuffle_toggle(self):
         with self.lock:
             cur = bool(self.playback and self.playback.get("shuffle_state"))
+            if self.playback:  # optimistic: flip the ⤨ icon now
+                self.playback["shuffle_state"] = not cur
         self._cmd(lambda: self.sp.shuffle(not cur), "shuffle")
 
     def devices(self):
@@ -338,6 +352,7 @@ class App:
         self.device_mode = False
         self.device_list = []
         self.device_sel = 0
+        self.device_loading = False
 
     # -- derived --
     def visible_tracks(self):
@@ -488,7 +503,10 @@ class App:
             put(win, y0 + i, x0, "║", Pal.c(Pal.YELLOW, bold=True))
             put(win, y0 + i, x0 + bw - 1, "║", Pal.c(Pal.YELLOW, bold=True))
         put(win, y0, x0 + 3, "[ ◈ SPOTIFY CONNECT DEVICES ]", Pal.c(Pal.YELLOW, bold=True))
-        if not self.device_list:
+        if self.device_loading and not self.device_list:
+            spin = SPINNER[self.spin % len(SPINNER)]
+            put(win, y0 + 2, x0 + 3, f"{spin} scanning devices…", Pal.c(Pal.GREEN))
+        elif not self.device_list:
             put(win, y0 + 2, x0 + 3, "none found — open Spotify on a device",
                 Pal.c(Pal.DIM))
         for i, d in enumerate(self.device_list[: bh - 4]):
@@ -541,9 +559,17 @@ class App:
         elif ch == 27:  # Esc clears search filter
             self.query = ""
         elif ch == ord("d"):
-            self.device_list = self.p.devices()
+            # open instantly; fetch in background — sp.devices() is a
+            # network call and must never run on the UI thread
             self.device_sel = 0
             self.device_mode = True
+            if not self.device_loading:
+                self.device_loading = True
+
+                def fetch():
+                    self.device_list = self.p.devices()
+                    self.device_loading = False
+                threading.Thread(target=fetch, daemon=True).start()
         elif ch == ord("r"):
             with self.p.lock:
                 self.p.loading = True
@@ -582,7 +608,7 @@ class App:
             curses.set_escdelay(25)  # default 1000ms makes Esc feel broken
         except AttributeError:
             pass
-        self.scr.timeout(250)
+        self.scr.timeout(100)  # background updates surface within ~100ms
         Pal.init()
         running = True
         while running:
@@ -599,7 +625,7 @@ class App:
                     if ch == -1:
                         break
                     running = self.handle(ch)
-                self.scr.timeout(250)
+                self.scr.timeout(100)
 
 
 def main():
@@ -618,7 +644,6 @@ def main():
               f"({REDIRECT_URI}) in the Spotify dashboard.{X}")
         sys.exit(1)
     print(f"  {G}✓ hello, {B}{me.get('display_name') or me['id']}{X}{G} — building bricks…{X}")
-    time.sleep(0.6)
 
     player = Player(sp)
     threading.Thread(target=player.load_likes, daemon=True).start()
