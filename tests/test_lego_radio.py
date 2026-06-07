@@ -18,19 +18,25 @@ from unittest import mock
 
 import lego_radio as lr
 
-# every load_likes() would otherwise write the user's real likes cache
+# load_likes()/_persist_position() would otherwise write the user's real
+# cache and cursor state; redirect both to a throwaway dir for the whole module
 _module_tmp = tempfile.TemporaryDirectory()
 _cache_patch = mock.patch.object(
     lr, "LIKES_CACHE_FILE", os.path.join(_module_tmp.name, "likes_cache.json")
+)
+_state_patch = mock.patch.object(
+    lr, "STATE_FILE", os.path.join(_module_tmp.name, "state.json")
 )
 
 
 def setUpModule():
     _cache_patch.start()
+    _state_patch.start()
 
 
 def tearDownModule():
     _cache_patch.stop()
+    _state_patch.stop()
     _module_tmp.cleanup()
 
 
@@ -740,6 +746,92 @@ class TestReload(AppTestBase):
         self.assertTrue(
             wait_until(lambda: not self.p.loading and len(self.p.tracks) == 3)
         )
+
+
+class TestRestoreCursor(AppTestBase):
+    def test_selected_uri_reports_current_selection(self):
+        app = self.make_app(5)
+        app.sel = 3
+        self.assertEqual(app.selected_uri(), "spotify:track:3")
+
+    def test_launch_restores_saved_cursor(self):
+        app = self.make_app(5)
+        app._saved_uri = "spotify:track:4"
+        app._restore_cursor(app.visible_tracks())
+        self.assertEqual(app.sel, 4)
+        self.assertTrue(app._restored_saved)
+
+    def test_restore_ignores_playback_keeps_scroll_position(self):
+        # scroll position wins; a playing track must not move the cursor
+        app = self.make_app(5)
+        app._saved_uri = "spotify:track:3"
+        app.p.playback = {"item": {"uri": "spotify:track:1"}}
+        app._restore_cursor(app.visible_tracks())
+        self.assertEqual(app.sel, 3)
+
+    def test_keystroke_cancels_pending_launch_restore(self):
+        app = self.make_app(5)
+        app._saved_uri = "spotify:track:4"
+        app.handle(ord("j"))  # user takes over before the list settles
+        self.assertTrue(app._restored_saved)
+        app.sel = 0
+        app._restore_cursor(app.visible_tracks())
+        self.assertEqual(app.sel, 0)  # restore no longer fires
+
+    def test_active_filter_suppresses_restore(self):
+        app = self.make_app(5)
+        app._saved_uri = "spotify:track:4"
+        app.query = "söng 2"
+        app._restore_cursor(app.visible_tracks())
+        self.assertFalse(app._restored_saved)
+
+    def test_reload_reanchors_cursor_by_uri(self):
+        app = self.make_app(5)
+        app.sel = 2
+        app.handle(ord("r"))  # captures spotify:track:2 as pending
+        self.assertEqual(app._pending_uri, "spotify:track:2")
+        # simulate reload shifting the list: track 2 is now at index 4
+        shifted = list(reversed(app.p.tracks))
+        app._restore_cursor(shifted)
+        self.assertEqual(shifted[app.sel]["uri"], "spotify:track:2")
+        self.assertIsNone(app._pending_uri)
+
+    def test_persist_position_saves_only_on_change(self):
+        app = self.make_app(5)
+        app.sel = 2
+        with mock.patch.object(lr, "save_state") as save:
+            app._persist_position()
+            save.assert_called_once_with({"sel_uri": "spotify:track:2"})
+            app._persist_position()  # unchanged → no second write
+            save.assert_called_once()
+            app.sel = 4
+            app._persist_position()
+            self.assertEqual(save.call_count, 2)
+            self.assertEqual(save.call_args[0][0], {"sel_uri": "spotify:track:4"})
+
+
+class TestStateFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        state = os.path.join(self.tmp.name, "state.json")
+        patcher = mock.patch.object(lr, "STATE_FILE", state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state_file = state
+
+    def test_roundtrip_with_0600(self):
+        lr.save_state({"sel_uri": "spotify:track:abc"})
+        self.assertEqual(lr.load_state(), {"sel_uri": "spotify:track:abc"})
+        self.assertEqual(os.stat(self.state_file).st_mode & 0o777, 0o600)
+
+    def test_load_missing_returns_empty(self):
+        self.assertEqual(lr.load_state(), {})
+
+    def test_load_corrupt_returns_empty(self):
+        with open(self.state_file, "w") as f:
+            f.write("not json{")
+        self.assertEqual(lr.load_state(), {})
 
 
 class TestPlayerSearch(unittest.TestCase):

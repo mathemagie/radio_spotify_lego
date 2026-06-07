@@ -32,6 +32,7 @@ CONFIG_DIR = os.path.expanduser("~/.config/lego_radio")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_FILE = os.path.join(CONFIG_DIR, "token_cache.json")
 LIKES_CACHE_FILE = os.path.join(CONFIG_DIR, "likes_cache.json")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 REDIRECT_URI = "http://127.0.0.1:8888/callback"
 SCOPES = (
     "user-library-read user-read-playback-state "
@@ -64,6 +65,25 @@ def save_config(cfg):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
     os.chmod(CONFIG_FILE, 0o600)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+        os.chmod(STATE_FILE, 0o600)
+    except OSError:
+        pass  # best-effort; losing the cursor position is not worth crashing
 
 
 def first_run_wizard():
@@ -539,11 +559,20 @@ def put(win, y, x, text, attr=0):
 
 
 class App:
-    def __init__(self, stdscr, player):
+    def __init__(self, stdscr, player, saved_uri=None):
         self.scr = stdscr
         self.p = player
         self.sel = 0
         self.top = 0
+        # restore cursor across restarts (see _restore_cursor): land back on
+        # last session's track once the list loads. Position is saved
+        # continuously as the cursor moves (see _persist_position), so a
+        # crash keeps it too. Restore is one-shot and yields once the user
+        # navigates.
+        self._saved_uri = saved_uri
+        self._restored_saved = False
+        self._pending_uri = None  # [r] reload re-anchor target
+        self._last_saved_uri = saved_uri  # avoids rewriting the same value
         self.query = ""
         self.searching = False
         self.global_query = ""
@@ -582,6 +611,46 @@ class App:
         vis = [t for t in source if q in t["key"]]
         self._vis_cache = (tracks, self.query, q, vis)
         return vis
+
+    def selected_uri(self):
+        tracks = self.visible_tracks()
+        if tracks and 0 <= self.sel < len(tracks):
+            return tracks[self.sel]["uri"]
+        return None
+
+    @staticmethod
+    def _index_of(tracks, uri):
+        if not uri:
+            return None
+        return next((i for i, t in enumerate(tracks) if t["uri"] == uri), None)
+
+    def _restore_cursor(self, tracks):
+        """Land the cursor back on a remembered track once the list loads.
+
+        [r] reload re-anchors to the same track by uri; launch restores last
+        session's cursor. Both are one-shot and stop firing once the user
+        navigates.
+        """
+        if not tracks or self.query:
+            return
+        if self._pending_uri:  # [r] reload: keep position by uri
+            idx = self._index_of(tracks, self._pending_uri)
+            if idx is not None:
+                self.sel = idx
+                self._pending_uri = None
+            return
+        if not self._restored_saved:
+            idx = self._index_of(tracks, self._saved_uri)
+            if idx is not None:
+                self.sel = idx
+            self._restored_saved = True  # one-shot even if the uri is gone
+
+    def _persist_position(self):
+        """Save the highlighted track whenever it changes (crash-safe)."""
+        uri = self.selected_uri()
+        if uri and uri != self._last_saved_uri:
+            self._last_saved_uri = uri
+            save_state({"sel_uri": uri})
 
     # -- drawing --
     def draw(self):
@@ -630,16 +699,18 @@ class App:
     def draw_list(self, top, bot, w):
         tracks = self.visible_tracks()
         rows = max(1, bot - top)
+
+        with self.p.lock:
+            pb = self.p.playback
+        cur_uri = ((pb or {}).get("item") or {}).get("uri")
+
+        self._restore_cursor(tracks)
         self.sel = max(0, min(self.sel, len(tracks) - 1)) if tracks else 0
         if self.sel < self.top:
             self.top = self.sel
         if self.sel >= self.top + rows:
             self.top = self.sel - rows + 1
         self.top = max(0, min(self.top, max(0, len(tracks) - rows)))
-
-        with self.p.lock:
-            pb = self.p.playback
-        cur_uri = ((pb or {}).get("item") or {}).get("uri")
 
         if not tracks:
             with self.p.lock:
@@ -868,6 +939,9 @@ class App:
             return self.handle_search(ch)
         if self.global_searching:
             return self.handle_global(ch)
+        # any real keystroke means the user has taken the wheel — stop the
+        # pending launch restore from yanking the cursor out from under them
+        self._restored_saved = True
         tracks = self.visible_tracks()
         if ch in (ord("q"),):
             return False
@@ -936,6 +1010,9 @@ class App:
 
                 threading.Thread(target=fetch, daemon=True).start()
         elif ch == ord("r"):
+            # keep the cursor on the same track even if reload reorders the
+            # list (e.g. a freshly liked song shifts everything down)
+            self._pending_uri = self.selected_uri()
             with self.p.lock:
                 self.p.loading = True
             threading.Thread(target=self.p.load_likes, daemon=True).start()
@@ -1019,6 +1096,8 @@ class App:
                         break
                     running = self.handle(ch)
                 self.scr.timeout(50)
+            # once per batch (not per keystroke) so held arrows = one write
+            self._persist_position()
 
 
 def main():
@@ -1047,8 +1126,12 @@ def main():
     stop = threading.Event()
     threading.Thread(target=player.poll_loop, args=(stop,), daemon=True).start()
 
+    saved_uri = load_state().get("sel_uri")
     try:
-        curses.wrapper(lambda scr: App(scr, player).run())
+        # cursor position is saved continuously as it moves (App._persist_position)
+        curses.wrapper(lambda scr: App(scr, player, saved_uri=saved_uri).run())
+    except KeyboardInterrupt:
+        pass  # Ctrl-C quits like [q] — curses.wrapper already restored the tty
     finally:
         stop.set()
         print(f"{Y}  ▘▘ ▘▘ ▘▘  thanks for listening — LEGO RADIO  ▘▘ ▘▘ ▘▘{X}")
