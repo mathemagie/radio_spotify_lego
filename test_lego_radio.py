@@ -410,6 +410,19 @@ class TestSearch(AppTestBase):
         self.assertFalse(app.searching)
         self.assertEqual(app.query, "")
 
+    def test_filter_result_is_memoized_per_query_and_tracks(self):
+        app = self.make_app(12)
+        self.type_query(app, "song 1")
+        first = app.visible_tracks()
+        self.assertIs(app.visible_tracks(), first)   # same query → cached
+        app.handle(ord("1"))                          # query changed
+        self.assertIsNot(app.visible_tracks(), first)
+        with self.p.lock:                             # loader replaces list
+            self.p.tracks = list(self.p.tracks)
+        stale = app.visible_tracks()
+        self.assertIsNot(stale, first)
+        self.assertEqual([t["name"] for t in stale], ["Söng 11"])
+
     def test_enter_plays_from_filtered_list(self):
         app = self.make_app(12)
         played = []

@@ -17,6 +17,7 @@ First run walks you through creating a (free) Spotify Client ID.
 """
 
 import curses
+import functools
 import json
 import os
 import sys
@@ -289,6 +290,7 @@ class Player:
 # ───────────────────────────── ui helpers ─────────────────────────────
 
 
+@functools.lru_cache(maxsize=4096)
 def fold(s):
     return "".join(c for c in unicodedata.normalize("NFD", s.lower())
                    if unicodedata.category(c) != "Mn")
@@ -362,6 +364,7 @@ class App:
         self.device_sel = 0
         self.device_loading = False
         self.all_keys = False  # footer: core keys by default, ? shows all
+        self._vis_cache = None  # (tracks identity, query) -> filtered list
 
     # -- derived --
     def visible_tracks(self):
@@ -369,8 +372,15 @@ class App:
             tracks = self.p.tracks
         if not self.query:
             return tracks
+        # memoized: draw() calls this several times per frame, and the
+        # loader replaces p.tracks wholesale, so identity is a valid key
+        cached = self._vis_cache
+        if cached and cached[0] is tracks and cached[1] == self.query:
+            return cached[2]
         q = fold(self.query)
-        return [t for t in tracks if q in t["key"]]
+        vis = [t for t in tracks if q in t["key"]]
+        self._vis_cache = (tracks, self.query, vis)
+        return vis
 
     # -- drawing --
     def draw(self):
