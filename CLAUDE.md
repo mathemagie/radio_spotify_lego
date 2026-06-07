@@ -11,10 +11,12 @@ LEGO Radio — a single-file Python curses TUI (`lego_radio.py`) that plays the 
 ```bash
 .venv/bin/pip install -r requirements.txt   # only dependency: spotipy
 .venv/bin/python lego_radio.py              # run the app
+.venv/bin/python -m unittest -v             # run the test suite (test_lego_radio.py)
+.venv/bin/python -m unittest test_lego_radio.TestSearch -v   # one test class
 .venv/bin/python -m py_compile lego_radio.py  # syntax check
 ```
 
-There is no test suite. To smoke-test UI changes without Spotify auth, instantiate `Player` with a fake `sp` object, populate `player.tracks` / `player.playback` directly, then drive `App.draw()` / `App.handle(ch)` under `curses.initscr()` (see git history / past sessions for the pattern). `curses.wrapper` cleanup fails without a real tty — catch `curses.error` around `endwin()` in sandboxed runs.
+Tests are stdlib `unittest` only (no pytest — keep it dependency-free). They never initialize curses: `App(None, player)` is fine as long as draw paths aren't touched. The Spotify client is replaced by `FakeSP` (records calls, raises on demand, can gate `devices()` on an Event); command threads are real, so tests synchronize on observable effects with `wait_until()`. Curses draw paths are covered separately by a pty smoke test: instantiate `Player` with a fake `sp`, populate `player.tracks` / `player.playback`, then drive `App.draw()` / `App.handle(ch)` under `curses.initscr()`. `curses.wrapper` cleanup fails without a real tty — catch `curses.error` around `endwin()` in sandboxed runs.
 
 ## Architecture
 
