@@ -27,6 +27,18 @@ Everything lives in `src/lego_radio.py`, in four layers (top to bottom of file):
 3. **UI helpers** — `Pal` registers numbered color pairs (256-color with an 8-color fallback); `put()` is the only safe way to write to the screen (clips at edges, swallows `curses.error`). Always use `put()`, never raw `addstr`.
 4. **`App`** — the curses loop. `scr.timeout(250)` getch drives both input and redraws (progress bar interpolates from `poll_ts` between polls). Input is modal: `handle()` dispatches to `handle_search()` or `handle_devices()` when those modes are active. Track filtering (`visible_tracks`) is accent/case-insensitive via `fold()`. "Play" sends a `uris` chunk of up to 100 tracks starting at the selection (the API can't target the Liked Songs collection as a context).
 
+## Debugging / logs
+
+`setup_logging()` (called first thing in `main()`) routes **all** logging — the
+app's own `log = logging.getLogger("lego_radio")`, spotipy/urllib3, and captured
+`warnings` — to a rotating file at `~/.config/lego_radio/lego_radio.log` (and
+**nothing** to stderr, so stray output can't corrupt the curses screen). Uncaught
+exceptions on the main thread and in worker threads are logged via
+`sys.excepthook` / `threading.excepthook`; a curses-loop crash is logged then
+re-raised. **When the app misbehaves or crashes, read that log file first** — it
+records startup, auth, likes loading, every user-facing error (`flag_error` logs
+centrally), command failures, and full tracebacks.
+
 ## Conventions
 
 - Keep it a single file; no new dependencies beyond spotipy unless necessary.

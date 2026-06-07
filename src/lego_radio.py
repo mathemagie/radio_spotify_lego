@@ -20,6 +20,8 @@ import concurrent.futures
 import curses
 import functools
 import json
+import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -33,6 +35,9 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_FILE = os.path.join(CONFIG_DIR, "token_cache.json")
 LIKES_CACHE_FILE = os.path.join(CONFIG_DIR, "likes_cache.json")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+LOG_FILE = os.path.join(CONFIG_DIR, "lego_radio.log")
+
+log = logging.getLogger("lego_radio")
 REDIRECT_URI = "http://127.0.0.1:8888/callback"
 SCOPES = (
     "user-library-read user-library-modify user-read-playback-state "
@@ -236,7 +241,9 @@ class Player:
                 self.tracks = items
                 self.load_count = len(items)
             self._write_likes_cache(items)
+            log.info("loaded %d liked songs", len(items))
         except Exception as e:
+            log.exception("load_likes failed")
             self.flag_error(f"likes: {e}")  # keep cached tracks on screen
         finally:
             with self.lock:
@@ -317,6 +324,7 @@ class Player:
                 time.sleep(0.25)
                 self.poll()
             except Exception as e:
+                log.warning("command %s failed: %s", label, e)
                 msg = str(e)
                 if "NO_ACTIVE_DEVICE" in msg or "Device not found" in msg:
                     # [o] opens the web player, which registers as a
@@ -488,6 +496,7 @@ class Player:
         return devs[0]["id"] if devs else None
 
     def flag_error(self, msg):
+        log.error(msg)
         with self.lock:
             self.error = msg[:200]
             self.error_ts = time.monotonic()
@@ -985,6 +994,9 @@ class App:
     def handle(self, ch):
         if ch == -1:
             return True
+        if ch in (curses.KEY_RESIZE, 12):  # resize or Ctrl-L → full repaint
+            self.scr.clear()
+            return True
         if self.device_mode:
             return self.handle_devices(ch)
         if self.searching:
@@ -1155,7 +1167,51 @@ class App:
             self._persist_position()
 
 
+def setup_logging():
+    """Route all logging (ours + spotipy/urllib3 + warnings) to a file.
+
+    Nothing goes to stderr, so the curses screen stays clean (stray stderr
+    text used to leave a ghost now-playing panel after NO_ACTIVE_DEVICE).
+    The file at LOG_FILE is the place to look — or to hand to an agent —
+    after a crash; it rotates so it never grows without bound.
+    """
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=512_000, backupCount=3, encoding="utf-8"
+        )
+    except OSError:
+        return  # never let logging setup stop the app from running
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers.clear()  # drop any default/stderr handler
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    logging.captureWarnings(True)  # warnings.warn() → py.warnings logger → file
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass
+
+    def _log_uncaught(exc_type, exc, tb):
+        if not issubclass(exc_type, KeyboardInterrupt):
+            log.critical("uncaught exception", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _log_uncaught
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = lambda a: log.critical(
+            "uncaught exception in thread %s",
+            a.thread.name if a.thread else "?",
+            exc_info=(a.exc_type, a.exc_value, a.exc_traceback),
+        )
+
+
 def main():
+    setup_logging()
+    log.info("starting LEGO Radio")
     cfg = load_config()
     if not cfg.get("client_id"):
         cfg = first_run_wizard()
@@ -1166,12 +1222,14 @@ def main():
         sp = get_spotify(cfg)
         me = sp.current_user()
     except Exception as e:
+        log.exception("auth failed")
         print(f"  {R}✗ auth failed: {e}{X}")
         print(
             f"  {D}check your Client ID and the Redirect URI "
             f"({REDIRECT_URI}) in the Spotify dashboard.{X}"
         )
         sys.exit(1)
+    log.info("authenticated as %s", me.get("display_name") or me.get("id"))
     print(
         f"  {G}✓ hello, {B}{me.get('display_name') or me['id']}{X}{G} — building bricks…{X}"
     )
@@ -1187,8 +1245,14 @@ def main():
         curses.wrapper(lambda scr: App(scr, player, saved_uri=saved_uri).run())
     except KeyboardInterrupt:
         pass  # Ctrl-C quits like [q] — curses.wrapper already restored the tty
+    except Exception:
+        # curses.wrapper has restored the tty; record the crash for later
+        log.exception("crashed in the curses loop")
+        print(f"  {R}✗ crashed — see {LOG_FILE}{X}")
+        raise
     finally:
         stop.set()
+        log.info("exiting")
         print(f"{Y}  ▘▘ ▘▘ ▘▘  thanks for listening — LEGO RADIO  ▘▘ ▘▘ ▘▘{X}")
 
 

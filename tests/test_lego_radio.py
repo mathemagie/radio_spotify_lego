@@ -9,7 +9,9 @@ observable effects with wait_until().
 
 import curses
 import json
+import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -1227,6 +1229,61 @@ class TestOpenInBrowser(AppTestBase):
         ):
             lr.open_url("https://open.spotify.com/track/x")
         default.assert_called_once_with("https://open.spotify.com/track/x")
+
+
+class TestRedraw(AppTestBase):
+    def test_resize_and_ctrl_l_force_full_repaint(self):
+        app = self.make_app(3)
+        cleared = []
+
+        class FakeScr:
+            def clear(self):
+                cleared.append(True)
+
+        app.scr = FakeScr()
+        self.assertTrue(app.handle(curses.KEY_RESIZE))
+        self.assertTrue(app.handle(12))  # Ctrl-L
+        self.assertEqual(len(cleared), 2)
+
+
+class TestLogging(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for attr, val in (
+            ("CONFIG_DIR", self.tmp.name),
+            ("LOG_FILE", os.path.join(self.tmp.name, "lego_radio.log")),
+        ):
+            p = mock.patch.object(lr, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        # setup_logging mutates global logging + excepthooks; restore them
+        root = logging.getLogger()
+        saved = (root.handlers[:], root.level, sys.excepthook, threading.excepthook)
+
+        def restore():
+            root.handlers[:] = saved[0]
+            root.setLevel(saved[1])
+            sys.excepthook = saved[2]
+            threading.excepthook = saved[3]
+
+        self.addCleanup(restore)
+
+    def test_setup_logging_writes_to_file_not_stderr(self):
+        import contextlib
+        import io
+
+        lr.setup_logging()
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            # spotipy logs every HTTP error like this (client.py:288)
+            logging.getLogger("spotipy.client").error("HTTP Error for PUT /x")
+            lr.log.error("boom from app")
+        self.assertEqual(buf.getvalue(), "")  # nothing corrupts the curses screen
+        with open(lr.LOG_FILE, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("HTTP Error for PUT /x", content)
+        self.assertIn("boom from app", content)
 
 
 if __name__ == "__main__":
