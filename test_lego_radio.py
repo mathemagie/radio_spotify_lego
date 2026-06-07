@@ -162,9 +162,9 @@ class TestLoadLikes(unittest.TestCase):
     def test_paginates_and_precomputes_search_key(self):
         pages = [
             {"items": [{"track": mk_track(i, name=f"Sönг {i}")} for i in range(50)],
-             "next": "url"},
+             "total": 51},
             {"items": [{"track": mk_track(50, name="Pour louper l'école",
-                                          artist="Aldebert")}], "next": None},
+                                          artist="Aldebert")}], "total": 51},
         ]
         p = lr.Player(FakeSP(pages=pages))
         p.load_likes()
@@ -174,8 +174,24 @@ class TestLoadLikes(unittest.TestCase):
         self.assertIn("l'ecole", p.tracks[50]["key"])   # folded
         self.assertIn("aldebert", p.tracks[50]["key"])  # artist searchable
 
+    def test_remaining_pages_fetched_concurrently_in_order(self):
+        pages = [
+            {"items": [{"track": mk_track(50 * pg + i)} for i in range(50)],
+             "total": 150}
+            for pg in range(3)
+        ]
+        p = lr.Player(FakeSP(pages=pages))
+        p.load_likes()
+        # all offsets requested, results stitched back in liked order
+        offsets = sorted(kw["offset"]
+                         for kw in p.sp.calls_to("current_user_saved_tracks"))
+        self.assertEqual(offsets, [0, 50, 100])
+        self.assertEqual(len(p.tracks), 150)
+        self.assertEqual([t["uri"] for t in p.tracks],
+                         [f"spotify:track:{i:022d}" for i in range(150)])
+
     def test_skips_null_tracks(self):
-        pages = [{"items": [{"track": None}, {"track": mk_track(1)}], "next": None}]
+        pages = [{"items": [{"track": None}, {"track": mk_track(1)}], "total": 2}]
         p = lr.Player(FakeSP(pages=pages))
         p.load_likes()
         self.assertEqual(len(p.tracks), 1)
@@ -224,6 +240,18 @@ class TestPlayFrom(unittest.TestCase):
         self.p.play_from(0, [])
         time.sleep(0.05)
         self.assertEqual(self.sp.calls, [])
+
+    def test_play_is_optimistic_same_frame(self):
+        self.p.play_from(7, self.tracks)
+        # before the API round-trip: selected track already shown as playing
+        item = self.p.playback["item"]
+        self.assertEqual(item["uri"], "spotify:track:7")
+        self.assertEqual(item["name"], "S7")
+        self.assertTrue(self.p.playback["is_playing"])
+        self.assertEqual(self.p.playback["progress_ms"], 0)
+        # device info survives so the status bar doesn't flicker
+        self.assertEqual(self.p.playback["device"]["id"], "dev1")
+        self.assertTrue(wait_until(lambda: self.sp.calls_to("start_playback")))
 
     def test_falls_back_to_first_known_device(self):
         self.p.playback = None
@@ -296,6 +324,14 @@ class TestPlaybackCommands(unittest.TestCase):
         self.sp.raises["next_track"] = RuntimeError("NO_ACTIVE_DEVICE found")
         self.p.next()
         self.assertTrue(wait_until(lambda: "no active device" in self.p.error))
+
+    def test_cmd_failure_reconciles_with_a_poll(self):
+        # optimistic flip must be reverted promptly when the command fails,
+        # not left wrong until the next 2.5s poll tick
+        self.sp.raises["pause_playback"] = RuntimeError("boom")
+        self.p.toggle_pause()  # optimistic flip to paused happens same-frame
+        self.assertTrue(wait_until(lambda: self.sp.calls_to("current_playback")))
+        self.assertTrue(wait_until(lambda: self.p.playback["is_playing"]))
 
     def test_cmd_translates_premium_required(self):
         self.sp.raises["pause_playback"] = RuntimeError("PREMIUM_REQUIRED")
@@ -515,7 +551,7 @@ class TestReload(AppTestBase):
     def test_r_reloads_likes_in_background(self):
         app = self.make_app(n_tracks=2)
         self.sp.pages = [{"items": [{"track": mk_track(i)} for i in range(3)],
-                          "next": None}]
+                          "total": 3}]
         app.handle(ord("r"))
         self.assertTrue(wait_until(lambda: not self.p.loading and
                                    len(self.p.tracks) == 3))

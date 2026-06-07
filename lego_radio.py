@@ -16,6 +16,7 @@ for playback control — that's a Spotify API rule, not ours.
 First run walks you through creating a (free) Spotify Client ID.
 """
 
+import concurrent.futures
 import curses
 import functools
 import json
@@ -129,33 +130,49 @@ class Player:
         self.error_ts = 0.0
 
     # -- liked songs --
+    @staticmethod
+    def _parse_page(page):
+        items = []
+        for it in page["items"]:
+            t = it.get("track")
+            if not t or not t.get("uri"):
+                continue
+            artist = ", ".join(a["name"] for a in t["artists"])
+            album = (t.get("album") or {}).get("name", "")
+            items.append({
+                "uri": t["uri"],
+                "name": t["name"],
+                "artist": artist,
+                "album": album,
+                "ms": t.get("duration_ms", 0),
+                # precomputed search key — folding 400+ strings per
+                # frame while typing is what made search feel slow
+                "key": fold(t["name"] + " " + artist + " " + album),
+            })
+        return items
+
     def load_likes(self):
         try:
-            items, offset = [], 0
-            while True:
-                page = self.sp.current_user_saved_tracks(limit=50, offset=offset)
-                for it in page["items"]:
-                    t = it.get("track")
-                    if not t or not t.get("uri"):
-                        continue
-                    artist = ", ".join(a["name"] for a in t["artists"])
-                    album = (t.get("album") or {}).get("name", "")
-                    items.append({
-                        "uri": t["uri"],
-                        "name": t["name"],
-                        "artist": artist,
-                        "album": album,
-                        "ms": t.get("duration_ms", 0),
-                        # precomputed search key — folding 400+ strings per
-                        # frame while typing is what made search feel slow
-                        "key": fold(t["name"] + " " + artist + " " + album),
-                    })
-                with self.lock:
-                    self.tracks = list(items)
-                    self.load_count = len(items)
-                offset += 50
-                if not page.get("next"):
-                    break
+            first = self.sp.current_user_saved_tracks(limit=50, offset=0)
+            items = self._parse_page(first)
+            with self.lock:
+                self.tracks = list(items)
+                self.load_count = len(items)
+            # the first page tells us the library size, so the remaining
+            # pages can be fetched concurrently (4 workers stays well under
+            # Spotify's rate limits) instead of one round-trip at a time.
+            # executor.map yields results in offset order, so the list
+            # still fills in top-to-bottom as pages land.
+            offsets = range(50, first.get("total") or 0, 50)
+            if offsets:
+                fetch = lambda o: self.sp.current_user_saved_tracks(
+                    limit=50, offset=o)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                    for page in ex.map(fetch, offsets):
+                        items = items + self._parse_page(page)
+                        with self.lock:
+                            self.tracks = items
+                            self.load_count = len(items)
         except Exception as e:
             self.flag_error(f"likes: {e}")
         finally:
@@ -194,14 +211,35 @@ class Player:
                 elif "PREMIUM_REQUIRED" in msg:
                     msg = "Spotify Premium is required for remote playback control"
                 self.flag_error(f"{label}: {msg}")
+                # the optimistic update is now wrong — reconcile immediately
+                # instead of leaving stale state until the next 2.5s poll
+                try:
+                    self.poll()
+                except Exception:
+                    pass
         threading.Thread(target=run, daemon=True).start()
 
     def play_from(self, idx, track_list):
         chunk = [t["uri"] for t in track_list[idx:idx + 100]]
         if not chunk:
             return
+        t = track_list[idx]
         with self.lock:
             shuffled = bool(self.playback and self.playback.get("shuffle_state"))
+            # optimistic: show the chosen track as playing now — the API
+            # round-trip + reconcile poll would otherwise leave the bar
+            # stale for up to a second after ⏎
+            self.playback = {
+                "is_playing": True,
+                "shuffle_state": False,
+                "progress_ms": 0,
+                "item": {"uri": t["uri"], "name": t["name"],
+                         "duration_ms": t["ms"],
+                         "artists": [{"name": t["artist"]}],
+                         "album": {"name": t["album"]}},
+                "device": (self.playback or {}).get("device"),
+            }
+            self.poll_ts = time.monotonic()
 
         def start():
             # _device_id() may hit the network — must run here in the
