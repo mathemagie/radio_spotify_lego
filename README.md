@@ -29,6 +29,19 @@ python3 -m venv .venv
 
 Or with the included Makefile: `make install && make run`.
 
+## Running on a Raspberry Pi (Nabaztag)
+
+Deployed to a Pi Zero W ([nabaztag_radio](https://github.com/mathemagie/nabaztag_radio)).
+Two helper scripts handle the quirks of that box:
+
+- **`run.sh`** (on the Pi) — launches the app, forcing a valid `TERM` so ncurses
+  doesn't crash with `setupterm: could not find terminal` on a bare SSH session.
+- **`run-on-pi.sh`** (from your Mac) — one-shot launcher: `ssh -t pi '~/radio_spotify_lego/run.sh'`.
+
+Pi notes: use **`spotipy==2.23.0`** (2.24+ needs Python ≥3.8; the Pi has 3.7).
+Copy `~/.config/lego_radio/` from a working machine so the OAuth token refreshes
+headlessly — no browser needed on the Pi.
+
 ## First-run setup (≈2 minutes, free)
 
 Spotify requires the API app to be registered under **your** account —
