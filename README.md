@@ -94,6 +94,14 @@ permission, so you may be asked to re-approve once after an update.)
 - **Liking does nothing / asks to log in again** — `a` needs the
   `user-library-modify` permission; approve it once in the browser when
   prompted after updating.
+- **A Spotify Connect device (e.g. a Raspberry Pi running raspotify) doesn't
+  show up in `d`** — it must be on the same Wi-Fi network as your phone/Spotify
+  account. Check what's currently on your LAN with
+  `nmap -sn 192.168.1.0/24` (install via `brew install nmap`), or find your
+  own network name/SSID with `networksetup -getairportnetwork en0`. To join
+  the Pi to that network headlessly, set the SSID/password in
+  `/etc/wpa_supplicant/wpa_supplicant.conf` (or via `raspi-config` →
+  System Options → Wireless LAN) and reboot it.
 
 ## Development
 
